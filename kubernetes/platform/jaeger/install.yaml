@@ -1,0 +1,73 @@
+---
+# Jaeger Distributed Tracing
+# Lightweight all-in-one deployment for ARM/Free Tier
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: jaeger
+  namespace: kube-system
+spec:
+  repo: https://jaegertracing.github.io/helm-charts
+  chart: jaeger
+  version: "0.73.1"
+  targetNamespace: observability
+  valuesContent: |-
+    # Use all-in-one for simplicity (includes collector, query, agent)
+    provisionDataStore:
+      cassandra: false
+      elasticsearch: false
+
+    allInOne:
+      enabled: true
+      replicas: 1
+      image: jaegertracing/all-in-one
+      tag: "1.53"
+      resources:
+        limits:
+          cpu: 500m
+          memory: 512Mi
+        requests:
+          cpu: 100m
+          memory: 256Mi
+      extraEnv:
+        - name: MEMORY_MAX_TRACES
+          value: "10000"
+        - name: SPAN_STORAGE_TYPE
+          value: "memory"
+      ingress:
+        enabled: true
+        ingressClassName: traefik
+        hosts:
+          - jaeger.nextopus.local
+
+    agent:
+      enabled: false  # Using all-in-one
+
+    collector:
+      enabled: false  # Using all-in-one
+
+    query:
+      enabled: false  # Using all-in-one
+
+    spark:
+      enabled: false
+
+    esIndexCleaner:
+      enabled: false
+---
+# ServiceMonitor for Jaeger metrics
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: jaeger
+  namespace: observability
+  labels:
+    app: jaeger
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: jaeger
+  endpoints:
+    - port: admin
+      interval: 30s
+      path: /metrics

@@ -1,0 +1,173 @@
+---
+# Istio Service Mesh Installation
+# Minimal profile optimized for ARM/Free Tier
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: istio-system
+  labels:
+    app.kubernetes.io/name: istio
+---
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: istio-base
+  namespace: kube-system
+spec:
+  repo: https://istio-release.storage.googleapis.com/charts
+  chart: base
+  version: "1.20.2"
+  targetNamespace: istio-system
+---
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: istiod
+  namespace: kube-system
+spec:
+  repo: https://istio-release.storage.googleapis.com/charts
+  chart: istiod
+  version: "1.20.2"
+  targetNamespace: istio-system
+  valuesContent: |-
+    pilot:
+      autoscaleEnabled: false
+      replicaCount: 1
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+      env:
+        PILOT_TRACE_SAMPLING: 100
+
+    global:
+      proxy:
+        resources:
+          requests:
+            cpu: 10m
+            memory: 64Mi
+          limits:
+            cpu: 100m
+            memory: 128Mi
+      tracer:
+        zipkin:
+          address: "jaeger-collector.observability:9411"
+
+    meshConfig:
+      enableTracing: true
+      defaultConfig:
+        tracing:
+          sampling: 100
+        holdApplicationUntilProxyStarts: true
+      accessLogFile: /dev/stdout
+      accessLogEncoding: JSON
+
+    telemetry:
+      enabled: true
+---
+# Istio Ingress Gateway (minimal)
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: istio-ingress
+  namespace: kube-system
+spec:
+  repo: https://istio-release.storage.googleapis.com/charts
+  chart: gateway
+  version: "1.20.2"
+  targetNamespace: istio-system
+  valuesContent: |-
+    name: istio-ingressgateway
+    replicaCount: 1
+    autoscaling:
+      enabled: false
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        cpu: 200m
+        memory: 256Mi
+    service:
+      type: LoadBalancer
+      ports:
+        - name: http2
+          port: 80
+          targetPort: 8080
+        - name: https
+          port: 443
+          targetPort: 8443
+---
+# Gateway for NextOpus
+apiVersion: networking.istio.io/v1beta1
+kind: Gateway
+metadata:
+  name: nextopus-gateway
+  namespace: nextopus
+spec:
+  selector:
+    istio: ingressgateway
+  servers:
+    - port:
+        number: 80
+        name: http
+        protocol: HTTP
+      hosts:
+        - "*.nextopus.local"
+        - "nextopus.local"
+---
+# Virtual Service for Data Processor
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: data-processor
+  namespace: nextopus
+spec:
+  hosts:
+    - "api.nextopus.local"
+  gateways:
+    - nextopus-gateway
+  http:
+    - match:
+        - uri:
+            prefix: /
+      route:
+        - destination:
+            host: data-processor
+            port:
+              number: 8080
+          weight: 100
+---
+# Destination Rule with mTLS
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: data-processor
+  namespace: nextopus
+spec:
+  host: data-processor
+  trafficPolicy:
+    tls:
+      mode: ISTIO_MUTUAL
+    connectionPool:
+      tcp:
+        maxConnections: 100
+      http:
+        h2UpgradePolicy: UPGRADE
+        http1MaxPendingRequests: 100
+        http2MaxRequests: 1000
+    loadBalancer:
+      simple: ROUND_ROBIN
+---
+# PeerAuthentication for mTLS
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: nextopus
+spec:
+  mtls:
+    mode: STRICT

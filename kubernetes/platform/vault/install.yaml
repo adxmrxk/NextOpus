@@ -1,0 +1,154 @@
+---
+# HashiCorp Vault Installation for K3s
+# Lightweight configuration for ARM/Free Tier
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: vault
+  labels:
+    app.kubernetes.io/name: vault
+---
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: vault
+  namespace: kube-system
+spec:
+  repo: https://helm.releases.hashicorp.com
+  chart: vault
+  version: "0.27.0"
+  targetNamespace: vault
+  valuesContent: |-
+    global:
+      enabled: true
+
+    injector:
+      enabled: true
+      replicas: 1
+      resources:
+        requests:
+          memory: 64Mi
+          cpu: 50m
+        limits:
+          memory: 128Mi
+          cpu: 100m
+
+    server:
+      enabled: true
+      image:
+        tag: "1.15.4"
+
+      resources:
+        requests:
+          memory: 128Mi
+          cpu: 100m
+        limits:
+          memory: 256Mi
+          cpu: 250m
+
+      # Dev mode for testing - switch to HA for production
+      dev:
+        enabled: false
+
+      standalone:
+        enabled: true
+        config: |
+          ui = true
+
+          listener "tcp" {
+            tls_disable = 1
+            address = "[::]:8200"
+            cluster_address = "[::]:8201"
+          }
+
+          storage "file" {
+            path = "/vault/data"
+          }
+
+      dataStorage:
+        enabled: true
+        size: 1Gi
+
+      ingress:
+        enabled: true
+        ingressClassName: traefik
+        hosts:
+          - host: vault.nextopus.local
+
+      # Reduce startup time
+      readinessProbe:
+        enabled: true
+        path: "/v1/sys/health?standbyok=true&sealedcode=204&uninitcode=204"
+
+    ui:
+      enabled: true
+---
+# Vault configuration for NextOpus secrets
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vault-config
+  namespace: vault
+data:
+  setup.sh: |
+    #!/bin/sh
+    set -e
+
+    # Wait for Vault to be ready
+    until vault status 2>/dev/null; do
+      echo "Waiting for Vault..."
+      sleep 5
+    done
+
+    # Check if already initialized
+    if vault status 2>/dev/null | grep -q "Initialized.*true"; then
+      echo "Vault already initialized"
+      exit 0
+    fi
+
+    # Initialize Vault
+    vault operator init -key-shares=1 -key-threshold=1 -format=json > /tmp/init.json
+
+    # Save keys (in production, use proper key management!)
+    UNSEAL_KEY=$(cat /tmp/init.json | jq -r '.unseal_keys_b64[0]')
+    ROOT_TOKEN=$(cat /tmp/init.json | jq -r '.root_token')
+
+    # Unseal
+    vault operator unseal $UNSEAL_KEY
+
+    # Login
+    vault login $ROOT_TOKEN
+
+    # Enable KV secrets engine
+    vault secrets enable -path=nextopus kv-v2
+
+    # Create a policy for the apps
+    vault policy write nextopus-app - <<EOF
+    path "nextopus/data/*" {
+      capabilities = ["read", "list"]
+    }
+    EOF
+
+    # Enable Kubernetes auth
+    vault auth enable kubernetes
+
+    # Configure Kubernetes auth
+    vault write auth/kubernetes/config \
+      kubernetes_host="https://$KUBERNETES_PORT_443_TCP_ADDR:443"
+
+    # Create role for nextopus namespace
+    vault write auth/kubernetes/role/nextopus-app \
+      bound_service_account_names=* \
+      bound_service_account_namespaces=nextopus \
+      policies=nextopus-app \
+      ttl=1h
+
+    # Store some initial secrets
+    vault kv put nextopus/config \
+      database_url="postgresql://user:pass@db:5432/nextopus" \
+      api_key="demo-api-key-change-me" \
+      environment="production"
+
+    echo "Vault setup complete!"
+    echo "Root Token: $ROOT_TOKEN"
+    echo "Unseal Key: $UNSEAL_KEY"
