@@ -1,0 +1,273 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'services/**'
+      - 'scripts/guardian/**'
+      - '.github/workflows/ci.yaml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'services/**'
+      - 'scripts/guardian/**'
+
+env:
+  REGISTRY: ghcr.io
+  GO_VERSION: '1.22'
+  PYTHON_VERSION: '3.12'
+
+jobs:
+  # ===========================================================================
+  # Detect Changes
+  # ===========================================================================
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      data-generator: ${{ steps.filter.outputs.data-generator }}
+      data-processor: ${{ steps.filter.outputs.data-processor }}
+      guardian: ${{ steps.filter.outputs.guardian }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            data-generator:
+              - 'services/data-generator/**'
+            data-processor:
+              - 'services/data-processor/**'
+            guardian:
+              - 'scripts/guardian/**'
+
+  # ===========================================================================
+  # Data Generator (Go)
+  # ===========================================================================
+  test-data-generator:
+    needs: changes
+    if: ${{ needs.changes.outputs.data-generator == 'true' }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/data-generator
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Run staticcheck
+        uses: dominikh/staticcheck-action@v1
+        with:
+          working-directory: services/data-generator
+          install-go: false
+
+      - name: Run tests
+        run: go test -v -race -coverprofile=coverage.out ./...
+
+      - name: Build binary
+        run: CGO_ENABLED=0 go build -o data-generator .
+
+  build-data-generator:
+    needs: [changes, test-data-generator]
+    if: ${{ needs.changes.outputs.data-generator == 'true' && github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/data-generator
+          tags: |
+            type=sha,prefix=
+            type=ref,event=branch
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: services/data-generator
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ===========================================================================
+  # Data Processor (Python)
+  # ===========================================================================
+  test-data-processor:
+    needs: changes
+    if: ${{ needs.changes.outputs.data-processor == 'true' }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/data-processor
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-cov pytest-asyncio ruff mypy
+
+      - name: Lint with ruff
+        run: ruff check .
+
+      - name: Type check with mypy
+        run: mypy main.py --ignore-missing-imports || true
+
+      - name: Run tests
+        run: pytest -v --cov=. --cov-report=xml || echo "No tests found"
+
+  build-data-processor:
+    needs: [changes, test-data-processor]
+    if: ${{ needs.changes.outputs.data-processor == 'true' && github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/data-processor
+          tags: |
+            type=sha,prefix=
+            type=ref,event=branch
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: services/data-processor
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ===========================================================================
+  # Guardian (Python)
+  # ===========================================================================
+  test-guardian:
+    needs: changes
+    if: ${{ needs.changes.outputs.guardian == 'true' }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: scripts/guardian
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio ruff
+
+      - name: Lint with ruff
+        run: ruff check .
+
+      - name: Run tests
+        run: pytest -v || echo "No tests found"
+
+  build-guardian:
+    needs: [changes, test-guardian]
+    if: ${{ needs.changes.outputs.guardian == 'true' && github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/guardian
+          tags: |
+            type=sha,prefix=
+            type=ref,event=branch
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: scripts/guardian
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

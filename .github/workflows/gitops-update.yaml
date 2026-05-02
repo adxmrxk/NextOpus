@@ -1,0 +1,48 @@
+name: GitOps Update
+
+on:
+  workflow_run:
+    workflows: ["CI Pipeline"]
+    types: [completed]
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  update-manifests:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get SHA
+        id: sha
+        run: echo "sha=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+
+      - name: Update data-generator image tag
+        run: |
+          sed -i "s|image: ghcr.io/.*/data-generator:.*|image: ghcr.io/${{ github.repository_owner }}/data-generator:${{ steps.sha.outputs.sha }}|g" \
+            kubernetes/apps/data-generator/deployment.yaml
+
+      - name: Update data-processor image tag
+        run: |
+          sed -i "s|image: ghcr.io/.*/data-processor:.*|image: ghcr.io/${{ github.repository_owner }}/data-processor:${{ steps.sha.outputs.sha }}|g" \
+            kubernetes/apps/data-processor/deployment.yaml
+
+      - name: Update guardian image tag
+        run: |
+          sed -i "s|image: ghcr.io/.*/guardian:.*|image: ghcr.io/${{ github.repository_owner }}/guardian:${{ steps.sha.outputs.sha }}|g" \
+            kubernetes/apps/guardian/deployment.yaml
+
+      - name: Commit and push
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add kubernetes/
+          git diff --staged --quiet || git commit -m "chore: update image tags to ${{ steps.sha.outputs.sha }}"
+          git push
