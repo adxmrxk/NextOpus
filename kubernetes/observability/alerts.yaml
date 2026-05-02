@@ -1,0 +1,148 @@
+---
+# NextOpus Custom Alerting Rules
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: nextopus-alerts
+  namespace: observability
+  labels:
+    app: nextopus
+    prometheus: kube-prometheus
+spec:
+  groups:
+    - name: nextopus.rules
+      interval: 30s
+      rules:
+        # High Error Rate
+        - alert: NextOpusHighErrorRate
+          expr: |
+            sum(rate(nextopus_processor_errors_total[5m])) > 0.1
+          for: 2m
+          labels:
+            severity: warning
+            service: nextopus
+          annotations:
+            summary: "High error rate in NextOpus processor"
+            description: "Error rate is {{ $value | printf \"%.2f\" }}/sec over the last 5 minutes"
+
+        # Service Down
+        - alert: NextOpusGeneratorDown
+          expr: |
+            sum(nextopus_generator_health) == 0
+          for: 1m
+          labels:
+            severity: critical
+            service: data-generator
+          annotations:
+            summary: "Data Generator service is down"
+            description: "All Data Generator instances are unhealthy"
+
+        - alert: NextOpusProcessorDown
+          expr: |
+            sum(nextopus_processor_health) == 0
+          for: 1m
+          labels:
+            severity: critical
+            service: data-processor
+          annotations:
+            summary: "Data Processor service is down"
+            description: "All Data Processor instances are unhealthy"
+
+        # High Latency
+        - alert: NextOpusHighLatency
+          expr: |
+            histogram_quantile(0.95, sum(rate(nextopus_processor_latency_seconds_bucket[5m])) by (le)) > 0.5
+          for: 5m
+          labels:
+            severity: warning
+            service: nextopus
+          annotations:
+            summary: "High processing latency in NextOpus"
+            description: "95th percentile latency is {{ $value | printf \"%.2f\" }}s"
+
+        # Buffer Full
+        - alert: NextOpusBufferFull
+          expr: |
+            nextopus_buffer_utilization > 80
+          for: 2m
+          labels:
+            severity: warning
+            service: data-generator
+          annotations:
+            summary: "Data Generator buffer is filling up"
+            description: "Buffer utilization is at {{ $value | printf \"%.0f\" }}%"
+
+        # Memory Usage High
+        - alert: NextOpusHighMemory
+          expr: |
+            nextopus_processor_events_in_memory > 40000
+          for: 5m
+          labels:
+            severity: warning
+            service: data-processor
+          annotations:
+            summary: "High memory usage in Data Processor"
+            description: "Events in memory: {{ $value | printf \"%.0f\" }}"
+
+        # Pod CrashLoopBackOff - Guardian will act on this
+        - alert: NextOpusPodCrashLoop
+          expr: |
+            increase(kube_pod_container_status_restarts_total{namespace="nextopus"}[1h]) > 3
+          for: 5m
+          labels:
+            severity: critical
+            service: nextopus
+            guardian_action: restart_pod
+          annotations:
+            summary: "Pod {{ $labels.pod }} is crash looping"
+            description: "Pod has restarted {{ $value | printf \"%.0f\" }} times in the last hour"
+
+        # High CPU Usage - Guardian will act on this
+        - alert: NextOpusHighCPU
+          expr: |
+            sum by (pod) (rate(container_cpu_usage_seconds_total{namespace="nextopus"}[5m]))
+            / sum by (pod) (kube_pod_container_resource_limits{namespace="nextopus", resource="cpu"}) > 0.9
+          for: 5m
+          labels:
+            severity: warning
+            service: nextopus
+            guardian_action: scale_up
+          annotations:
+            summary: "High CPU usage in {{ $labels.pod }}"
+            description: "CPU usage is at {{ $value | printf \"%.0f\" }}%"
+
+        # High Memory Usage - Guardian will act on this
+        - alert: NextOpusHighMemoryUsage
+          expr: |
+            sum by (pod) (container_memory_working_set_bytes{namespace="nextopus"})
+            / sum by (pod) (kube_pod_container_resource_limits{namespace="nextopus", resource="memory"}) > 0.85
+          for: 5m
+          labels:
+            severity: warning
+            service: nextopus
+            guardian_action: scale_up
+          annotations:
+            summary: "High memory usage in {{ $labels.pod }}"
+            description: "Memory usage is at {{ $value | printf \"%.0f\" }}%"
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: nextopus-apps
+  namespace: observability
+  labels:
+    app: nextopus
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/part-of: nextopus-platform
+  namespaceSelector:
+    matchNames:
+      - nextopus
+  endpoints:
+    - port: metrics
+      interval: 15s
+      path: /metrics
+    - port: http
+      interval: 15s
+      path: /metrics

@@ -1,0 +1,219 @@
+---
+# Prometheus Stack for NextOpus
+# Lightweight configuration optimized for ARM/Free Tier
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: prometheus
+  namespace: kube-system
+spec:
+  repo: https://prometheus-community.github.io/helm-charts
+  chart: kube-prometheus-stack
+  version: "56.0.0"
+  targetNamespace: observability
+  createNamespace: true
+  valuesContent: |-
+    # Reduce footprint for ARM/limited resources
+    prometheusOperator:
+      resources:
+        requests:
+          cpu: 50m
+          memory: 100Mi
+        limits:
+          cpu: 200m
+          memory: 200Mi
+
+    prometheus:
+      prometheusSpec:
+        replicas: 1
+        retention: 7d
+        retentionSize: "5GB"
+        resources:
+          requests:
+            cpu: 100m
+            memory: 512Mi
+          limits:
+            cpu: 500m
+            memory: 1Gi
+        storageSpec:
+          volumeClaimTemplate:
+            spec:
+              accessModes: ["ReadWriteOnce"]
+              resources:
+                requests:
+                  storage: 10Gi
+        serviceMonitorSelectorNilUsesHelmValues: false
+        podMonitorSelectorNilUsesHelmValues: false
+        ruleSelectorNilUsesHelmValues: false
+        additionalScrapeConfigs:
+          - job_name: 'nextopus-apps'
+            kubernetes_sd_configs:
+              - role: pod
+                namespaces:
+                  names:
+                    - nextopus
+            relabel_configs:
+              - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+                action: keep
+                regex: true
+              - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+                action: replace
+                target_label: __metrics_path__
+                regex: (.+)
+              - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+                action: replace
+                regex: ([^:]+)(?::\d+)?;(\d+)
+                replacement: $1:$2
+                target_label: __address__
+              - action: labelmap
+                regex: __meta_kubernetes_pod_label_(.+)
+
+    grafana:
+      enabled: true
+      adminPassword: "NextOpus2024!"  # Change in production!
+      resources:
+        requests:
+          cpu: 50m
+          memory: 128Mi
+        limits:
+          cpu: 200m
+          memory: 256Mi
+      persistence:
+        enabled: true
+        size: 2Gi
+      ingress:
+        enabled: true
+        ingressClassName: traefik
+        hosts:
+          - grafana.nextopus.local
+      dashboardProviders:
+        dashboardproviders.yaml:
+          apiVersion: 1
+          providers:
+            - name: 'nextopus'
+              orgId: 1
+              folder: 'NextOpus'
+              type: file
+              disableDeletion: false
+              editable: true
+              options:
+                path: /var/lib/grafana/dashboards/nextopus
+      dashboards:
+        nextopus:
+          nextopus-overview:
+            json: |
+              {
+                "title": "NextOpus Overview",
+                "uid": "nextopus-overview",
+                "tags": ["nextopus"],
+                "timezone": "browser",
+                "panels": [
+                  {
+                    "title": "Events Generated/sec",
+                    "type": "stat",
+                    "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+                    "targets": [{
+                      "expr": "sum(rate(nextopus_events_generated_total[5m]))",
+                      "legendFormat": "Events/sec"
+                    }]
+                  },
+                  {
+                    "title": "Events Processed/sec",
+                    "type": "stat",
+                    "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0},
+                    "targets": [{
+                      "expr": "sum(rate(nextopus_processor_events_processed_total[5m]))",
+                      "legendFormat": "Events/sec"
+                    }]
+                  },
+                  {
+                    "title": "Processing Errors",
+                    "type": "stat",
+                    "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
+                    "targets": [{
+                      "expr": "sum(rate(nextopus_processor_errors_total[5m]))",
+                      "legendFormat": "Errors/sec"
+                    }]
+                  },
+                  {
+                    "title": "Service Health",
+                    "type": "stat",
+                    "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
+                    "targets": [{
+                      "expr": "sum(nextopus_generator_health) + sum(nextopus_processor_health)",
+                      "legendFormat": "Healthy Services"
+                    }]
+                  },
+                  {
+                    "title": "Events by Type",
+                    "type": "timeseries",
+                    "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+                    "targets": [{
+                      "expr": "sum by (type) (rate(nextopus_events_generated_total[5m]))",
+                      "legendFormat": "{{type}}"
+                    }]
+                  },
+                  {
+                    "title": "Processing Latency",
+                    "type": "timeseries",
+                    "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+                    "targets": [{
+                      "expr": "histogram_quantile(0.99, sum(rate(nextopus_processor_latency_seconds_bucket[5m])) by (le))",
+                      "legendFormat": "p99"
+                    }, {
+                      "expr": "histogram_quantile(0.95, sum(rate(nextopus_processor_latency_seconds_bucket[5m])) by (le))",
+                      "legendFormat": "p95"
+                    }, {
+                      "expr": "histogram_quantile(0.50, sum(rate(nextopus_processor_latency_seconds_bucket[5m])) by (le))",
+                      "legendFormat": "p50"
+                    }]
+                  }
+                ],
+                "schemaVersion": 38,
+                "version": 1
+              }
+
+    alertmanager:
+      enabled: true
+      alertmanagerSpec:
+        replicas: 1
+        resources:
+          requests:
+            cpu: 25m
+            memory: 64Mi
+          limits:
+            cpu: 100m
+            memory: 128Mi
+
+    # Disable components we don't need
+    kubeStateMetrics:
+      enabled: true
+    nodeExporter:
+      enabled: true
+    kubeEtcd:
+      enabled: true
+    kubeControllerManager:
+      enabled: false  # K3s runs these differently
+    kubeScheduler:
+      enabled: false
+    kubeProxy:
+      enabled: false
+
+    # Default rules
+    defaultRules:
+      create: true
+      rules:
+        alertmanager: true
+        etcd: true
+        general: true
+        k8s: true
+        kubeApiserverAvailability: true
+        kubeApiserverSlos: true
+        kubelet: true
+        kubePrometheusNodeRecording: true
+        kubernetesApps: true
+        kubernetesResources: true
+        kubernetesStorage: true
+        kubernetesSystem: true
+        node: true
+        prometheus: true
