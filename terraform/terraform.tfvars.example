@@ -1,0 +1,92 @@
+################################################################################
+# NextOpus - Terraform Variables Configuration
+# Copy this file to terraform.tfvars and fill in your values
+################################################################################
+
+# ==============================================================================
+# OCI Authentication (REQUIRED)
+# Get these from OCI Console: Profile > User Settings > API Keys
+# ==============================================================================
+
+# Your tenancy OCID (starts with ocid1.tenancy)
+tenancy_ocid = "ocid1.tenancy.oc1..your-tenancy-ocid"
+
+# Your user OCID (starts with ocid1.user)
+user_ocid = "ocid1.user.oc1..your-user-ocid"
+
+# API key fingerprint (shown when you add the API key)
+fingerprint = "aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99"
+
+# Path to your OCI API private key file
+private_key_path = "~/.oci/oci_api_key.pem"
+
+# OCI Region (find your home region in OCI Console)
+# Common regions: us-ashburn-1, us-phoenix-1, eu-frankfurt-1, ap-tokyo-1
+region = "us-ashburn-1"
+
+# ==============================================================================
+# Optional: Compartment (defaults to tenancy root if not specified)
+# ==============================================================================
+
+# compartment_ocid = "ocid1.compartment.oc1..your-compartment-ocid"
+
+# ==============================================================================
+# Project Configuration
+# ==============================================================================
+
+project_name = "nextopus"
+environment  = "dev"
+
+# ==============================================================================
+# Network Configuration
+# ==============================================================================
+
+vcn_cidr            = "10.0.0.0/16"
+public_subnet_cidr  = "10.0.1.0/24"
+private_subnet_cidr = "10.0.2.0/24"
+
+# ==============================================================================
+# SSH Access
+# ==============================================================================
+
+# Path to your SSH public key (leave empty to auto-generate a key pair)
+ssh_public_key_path = "~/.ssh/id_rsa.pub"
+
+# Or provide the key content directly:
+# ssh_public_key = "ssh-rsa AAAA... your-key-comment"
+
+# ==============================================================================
+# Compute Configuration - Always Free Tier
+# Total Available: 4 OCPUs, 24GB RAM
+# Default: 1 Control Plane (1 OCPU, 6GB) + 3 Workers (1 OCPU, 6GB each)
+# ==============================================================================
+
+control_plane_config = {
+  ocpus       = 1
+  memory_gb   = 6
+  boot_volume = 50 # GB, Always Free allows up to 200GB total
+}
+
+worker_config = {
+  count       = 3
+  ocpus       = 1
+  memory_gb   = 6
+  boot_volume = 50
+}
+
+# ==============================================================================
+# Optional: Specific OS Image
+# Leave empty to auto-lookup Ubuntu 24.04 ARM
+# ==============================================================================
+
+# os_image_id = "ocid1.image.oc1..specific-image-ocid"
+
+# ==============================================================================
+# Tags
+# ==============================================================================
+
+freeform_tags = {
+  "ManagedBy" = "Terraform"
+  "Project"   = "NextOpus"
+  "Purpose"   = "K3s-Cluster"
+}
