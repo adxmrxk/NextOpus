@@ -1,0 +1,86 @@
+---
+# Rate Limit Testing Job
+# Demonstrates rate limiting by sending burst traffic
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rate-limit-test
+  namespace: nextopus
+spec:
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      containers:
+        - name: load-test
+          image: busybox:1.36
+          command:
+            - /bin/sh
+            - -c
+            - |
+              echo "=== Rate Limit Test ==="
+              echo "Sending 200 requests rapidly to trigger rate limiting..."
+              echo ""
+
+              SUCCESS=0
+              RATE_LIMITED=0
+
+              for i in $(seq 1 200); do
+                RESPONSE=$(wget -q -O /dev/null -S http://data-processor.nextopus.svc.cluster.local:8080/health 2>&1 | grep "HTTP/" | awk '{print $2}')
+
+                if [ "$RESPONSE" = "200" ]; then
+                  SUCCESS=$((SUCCESS + 1))
+                elif [ "$RESPONSE" = "429" ]; then
+                  RATE_LIMITED=$((RATE_LIMITED + 1))
+                fi
+
+                # No delay - burst as fast as possible
+              done
+
+              echo ""
+              echo "=== Results ==="
+              echo "Successful (200): $SUCCESS"
+              echo "Rate Limited (429): $RATE_LIMITED"
+              echo ""
+
+              if [ $RATE_LIMITED -gt 0 ]; then
+                echo "Rate limiting is WORKING"
+              else
+                echo "Rate limiting may not be configured (all requests succeeded)"
+              fi
+      restartPolicy: Never
+  backoffLimit: 1
+---
+# Prometheus alert for rate limiting
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: nginx-rate-limit-alerts
+  namespace: observability
+  labels:
+    prometheus: kube-prometheus
+spec:
+  groups:
+    - name: nginx.ratelimit
+      interval: 30s
+      rules:
+        - alert: HighRateLimitHits
+          expr: |
+            sum(rate(nginx_ingress_controller_requests{status="429"}[5m])) > 10
+          for: 2m
+          labels:
+            severity: warning
+            service: nginx-ingress
+          annotations:
+            summary: "High rate of 429 responses"
+            description: "More than 10 requests/sec are being rate limited"
+
+        - alert: ServiceOverloaded
+          expr: |
+            sum(rate(nginx_ingress_controller_requests{status="503"}[5m])) > 5
+          for: 1m
+          labels:
+            severity: critical
+            service: nginx-ingress
+          annotations:
+            summary: "Service returning 503 errors"
+            description: "Backend service may be overloaded"

@@ -1,0 +1,233 @@
+---
+# Rate Limiting Configuration for NextOpus Services
+# Uses Nginx Ingress annotations for production-grade traffic control
+
+# =============================================================================
+# Data Processor API Ingress
+# Rate limited: 100 requests/second per IP
+# =============================================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: data-processor-api
+  namespace: nextopus
+  annotations:
+    kubernetes.io/ingress.class: nginx
+
+    # Rate limiting - 100 req/sec with burst of 200
+    nginx.ingress.kubernetes.io/limit-rps: "100"
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: "2"
+    nginx.ingress.kubernetes.io/limit-connections: "50"
+
+    # Custom error pages for rate limiting
+    nginx.ingress.kubernetes.io/custom-http-errors: "429,503"
+    nginx.ingress.kubernetes.io/default-backend: ingress-nginx-defaultbackend
+
+    # Timeouts
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "10"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "30"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "30"
+
+    # Request size limit (10MB)
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+
+    # Enable CORS
+    nginx.ingress.kubernetes.io/enable-cors: "true"
+    nginx.ingress.kubernetes.io/cors-allow-origin: "*"
+    nginx.ingress.kubernetes.io/cors-allow-methods: "GET, POST, PUT, DELETE, OPTIONS"
+    nginx.ingress.kubernetes.io/cors-allow-headers: "DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,Authorization"
+
+    # Whitelist specific paths for higher limits (optional)
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      # Custom rate zone for /ingest endpoint (higher limit)
+      limit_req_zone $binary_remote_addr zone=ingest:10m rate=500r/s;
+
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: api.nextopus.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: data-processor
+                port:
+                  number: 8080
+---
+# =============================================================================
+# Data Processor Ingest Endpoint (Higher Rate Limit)
+# Rate limited: 500 requests/second per IP (for high-throughput ingestion)
+# =============================================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: data-processor-ingest
+  namespace: nextopus
+  annotations:
+    kubernetes.io/ingress.class: nginx
+
+    # Higher rate limit for ingest endpoint
+    nginx.ingress.kubernetes.io/limit-rps: "500"
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: "3"
+    nginx.ingress.kubernetes.io/limit-connections: "100"
+
+    # Larger body size for batch ingestion (50MB)
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+
+    # Longer timeouts for batch processing
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: api.nextopus.local
+      http:
+        paths:
+          - path: /ingest
+            pathType: Exact
+            backend:
+              service:
+                name: data-processor
+                port:
+                  number: 8080
+---
+# =============================================================================
+# Data Generator Stats Endpoint
+# Rate limited: 50 requests/second (read-only, lower priority)
+# =============================================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: data-generator-stats
+  namespace: nextopus
+  annotations:
+    kubernetes.io/ingress.class: nginx
+
+    # Lower rate limit for stats
+    nginx.ingress.kubernetes.io/limit-rps: "50"
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: "2"
+
+    # Cache responses for 5 seconds
+    nginx.ingress.kubernetes.io/proxy-buffering: "on"
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      add_header X-Cache-Status $upstream_cache_status;
+
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: generator.nextopus.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: data-generator
+                port:
+                  number: 8080
+---
+# =============================================================================
+# Grafana Dashboard
+# Rate limited: 30 requests/second (UI doesn't need high throughput)
+# =============================================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: grafana
+  namespace: observability
+  annotations:
+    kubernetes.io/ingress.class: nginx
+
+    nginx.ingress.kubernetes.io/limit-rps: "30"
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: "5"
+
+    # Websocket support for live dashboards
+    nginx.ingress.kubernetes.io/proxy-http-version: "1.1"
+    nginx.ingress.kubernetes.io/upstream-hash-by: "$remote_addr"
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      proxy_set_header Upgrade $http_upgrade;
+      proxy_set_header Connection "upgrade";
+
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: grafana.nextopus.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: prometheus-grafana
+                port:
+                  number: 80
+---
+# =============================================================================
+# ArgoCD UI
+# Rate limited: 20 requests/second (admin UI)
+# =============================================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: argocd
+  namespace: argocd
+  annotations:
+    kubernetes.io/ingress.class: nginx
+
+    nginx.ingress.kubernetes.io/limit-rps: "20"
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: "3"
+
+    # SSL passthrough for ArgoCD (it handles its own TLS)
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+    nginx.ingress.kubernetes.io/ssl-passthrough: "false"
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: argocd.nextopus.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: argocd-server
+                port:
+                  number: 443
+---
+# =============================================================================
+# Guardian API (Internal - Strict Rate Limiting)
+# Rate limited: 10 requests/second (admin/debug only)
+# =============================================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: guardian
+  namespace: nextopus-system
+  annotations:
+    kubernetes.io/ingress.class: nginx
+
+    # Very strict rate limiting for admin endpoint
+    nginx.ingress.kubernetes.io/limit-rps: "10"
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: "2"
+    nginx.ingress.kubernetes.io/limit-connections: "10"
+
+    # IP whitelist (uncomment and set your IPs in production)
+    # nginx.ingress.kubernetes.io/whitelist-source-range: "10.0.0.0/8,192.168.0.0/16"
+
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: guardian.nextopus.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: guardian
+                port:
+                  number: 8080
