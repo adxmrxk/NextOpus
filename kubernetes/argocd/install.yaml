@@ -1,0 +1,105 @@
+---
+# ArgoCD Installation for K3s
+# Deploy with: kubectl apply -n argocd -f install.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: argocd
+  labels:
+    app.kubernetes.io/name: argocd
+---
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: argocd
+  namespace: kube-system
+spec:
+  repo: https://argoproj.github.io/argo-helm
+  chart: argo-cd
+  version: "5.55.0"
+  targetNamespace: argocd
+  valuesContent: |-
+    global:
+      image:
+        tag: v2.10.0
+
+    # Reduce resource usage for ARM/free tier
+    controller:
+      replicas: 1
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+
+    server:
+      replicas: 1
+      resources:
+        requests:
+          cpu: 50m
+          memory: 128Mi
+        limits:
+          cpu: 200m
+          memory: 256Mi
+      extraArgs:
+        - --insecure  # Disable TLS (handle at ingress level)
+      ingress:
+        enabled: true
+        ingressClassName: traefik
+        hosts:
+          - argocd.nextopus.local
+        annotations:
+          traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
+
+    repoServer:
+      replicas: 1
+      resources:
+        requests:
+          cpu: 50m
+          memory: 128Mi
+        limits:
+          cpu: 200m
+          memory: 256Mi
+
+    applicationSet:
+      replicas: 1
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          cpu: 100m
+          memory: 128Mi
+
+    redis:
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          cpu: 100m
+          memory: 128Mi
+
+    dex:
+      enabled: false
+
+    notifications:
+      enabled: false
+
+    configs:
+      params:
+        server.insecure: true
+      cm:
+        # Admin password will be auto-generated
+        # Get with: kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d
+        admin.enabled: true
+        timeout.reconciliation: 180s
+        resource.exclusions: |
+          - apiGroups:
+              - cilium.io
+            kinds:
+              - CiliumIdentity
+            clusters:
+              - "*"

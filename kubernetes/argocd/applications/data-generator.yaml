@@ -1,0 +1,23 @@
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: data-generator
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+spec:
+  project: nextopus
+  source:
+    repoURL: https://github.com/YOUR_USERNAME/nextopus.git
+    targetRevision: main
+    path: kubernetes/apps/data-generator
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: nextopus
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

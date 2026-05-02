@@ -1,0 +1,94 @@
+---
+# Platform components (Vault, Istio, Kyverno, Jaeger)
+# Deploy with lower sync-wave to ensure they're ready before apps
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: platform-vault
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  project: nextopus
+  source:
+    repoURL: https://github.com/YOUR_USERNAME/nextopus.git
+    targetRevision: main
+    path: kubernetes/platform/vault
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: vault
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: platform-istio
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  project: nextopus
+  source:
+    repoURL: https://github.com/YOUR_USERNAME/nextopus.git
+    targetRevision: main
+    path: kubernetes/platform/istio
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: istio-system
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: platform-kyverno
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  project: nextopus
+  source:
+    repoURL: https://github.com/YOUR_USERNAME/nextopus.git
+    targetRevision: main
+    path: kubernetes/platform/kyverno
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: kyverno
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: platform-jaeger
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "4"
+spec:
+  project: nextopus
+  source:
+    repoURL: https://github.com/YOUR_USERNAME/nextopus.git
+    targetRevision: main
+    path: kubernetes/platform/jaeger
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: observability
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

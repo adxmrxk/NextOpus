@@ -1,0 +1,55 @@
+---
+# ArgoCD App-of-Apps Pattern
+# This is the root application that manages all other applications
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: nextopus
+  namespace: argocd
+spec:
+  description: NextOpus Platform Project
+  sourceRepos:
+    - "*"
+  destinations:
+    - namespace: "*"
+      server: https://kubernetes.default.svc
+  clusterResourceWhitelist:
+    - group: "*"
+      kind: "*"
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: nextopus-apps
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: nextopus
+  source:
+    repoURL: https://github.com/YOUR_USERNAME/nextopus.git  # Update with your repo
+    targetRevision: main
+    path: kubernetes/argocd/applications
+    directory:
+      recurse: true
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+      allowEmpty: false
+    syncOptions:
+      - CreateNamespace=true
+      - PrunePropagationPolicy=foreground
+      - PruneLast=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
