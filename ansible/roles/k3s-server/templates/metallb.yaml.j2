@@ -1,0 +1,86 @@
+---
+# MetalLB for bare-metal LoadBalancer services
+# Using L2 mode for simplicity on OCI
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: metallb-system
+  labels:
+    app: metallb
+---
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: metallb
+  namespace: kube-system
+spec:
+  repo: https://metallb.github.io/metallb
+  chart: metallb
+  targetNamespace: metallb-system
+  valuesContent: |-
+    controller:
+      resources:
+        limits:
+          cpu: 100m
+          memory: 128Mi
+        requests:
+          cpu: 25m
+          memory: 64Mi
+    speaker:
+      resources:
+        limits:
+          cpu: 100m
+          memory: 128Mi
+        requests:
+          cpu: 25m
+          memory: 64Mi
+      tolerations:
+        - key: "CriticalAddonsOnly"
+          operator: "Exists"
+          effect: "NoExecute"
+---
+# Wait for CRDs to be available before creating IPAddressPool
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: metallb-config-setup
+  namespace: metallb-system
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "1"
+spec:
+  template:
+    spec:
+      serviceAccountName: default
+      containers:
+      - name: kubectl
+        image: bitnami/kubectl:latest
+        command:
+        - /bin/sh
+        - -c
+        - |
+          sleep 30
+          cat <<EOF | kubectl apply -f -
+          apiVersion: metallb.io/v1beta1
+          kind: IPAddressPool
+          metadata:
+            name: default-pool
+            namespace: metallb-system
+          spec:
+            addresses:
+            - {{ hostvars[groups['control_plane'][0]]['private_ip'] }}/32
+          {% for host in groups['workers'] %}
+            - {{ hostvars[host]['private_ip'] }}/32
+          {% endfor %}
+          ---
+          apiVersion: metallb.io/v1beta1
+          kind: L2Advertisement
+          metadata:
+            name: default
+            namespace: metallb-system
+          spec:
+            ipAddressPools:
+            - default-pool
+          EOF
+      restartPolicy: OnFailure
+  backoffLimit: 4

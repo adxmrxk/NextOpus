@@ -1,0 +1,102 @@
+---
+################################################################################
+# NextOpus - Ansible Global Variables
+################################################################################
+
+# ==============================================================================
+# K3s Configuration
+# ==============================================================================
+
+k3s_version: "v1.31.2+k3s1"
+k3s_install_script_url: "https://get.k3s.io"
+
+# K3s server configuration
+k3s_server_args: >-
+  --disable traefik
+  --disable servicelb
+  --flannel-backend=vxlan
+  --write-kubeconfig-mode 644
+  --tls-san {{ hostvars[groups['control_plane'][0]]['ansible_host'] }}
+  --tls-san {{ hostvars[groups['control_plane'][0]]['private_ip'] }}
+  --node-taint CriticalAddonsOnly=true:NoExecute
+  --kube-controller-manager-arg bind-address=0.0.0.0
+  --kube-scheduler-arg bind-address=0.0.0.0
+  --etcd-expose-metrics true
+
+# K3s agent configuration
+k3s_agent_args: ""
+
+# Cluster networking
+cluster_cidr: "10.42.0.0/16"
+service_cidr: "10.43.0.0/16"
+cluster_dns: "10.43.0.10"
+
+# ==============================================================================
+# Security Configuration
+# ==============================================================================
+
+# SSH hardening
+ssh_port: 22
+ssh_permit_root_login: "no"
+ssh_password_authentication: "no"
+ssh_allowed_users: "ubuntu"
+
+# Firewall (UFW)
+ufw_enabled: true
+ufw_default_incoming: deny
+ufw_default_outgoing: allow
+
+# Allowed ports
+firewall_allowed_ports:
+  - { port: 22, proto: tcp, comment: "SSH" }
+  - { port: 80, proto: tcp, comment: "HTTP" }
+  - { port: 443, proto: tcp, comment: "HTTPS" }
+  - { port: 6443, proto: tcp, comment: "K3s API" }
+  - { port: 9345, proto: tcp, comment: "K3s Supervisor" }
+  - { port: 8472, proto: udp, comment: "Flannel VXLAN" }
+  - { port: 10250, proto: tcp, comment: "Kubelet" }
+  - { port: 10251, proto: tcp, comment: "Kube Scheduler" }
+  - { port: 10252, proto: tcp, comment: "Kube Controller" }
+  - { port: 2379, proto: tcp, comment: "etcd client" }
+  - { port: 2380, proto: tcp, comment: "etcd peer" }
+  - { port: "30000:32767", proto: tcp, comment: "NodePort Services" }
+
+# ==============================================================================
+# System Configuration
+# ==============================================================================
+
+# Timezone
+system_timezone: "UTC"
+
+# Swap (should be disabled for K8s)
+disable_swap: true
+
+# System packages to install
+common_packages:
+  - curl
+  - wget
+  - vim
+  - htop
+  - iotop
+  - net-tools
+  - jq
+  - git
+  - unzip
+  - apt-transport-https
+  - ca-certificates
+  - gnupg
+  - lsb-release
+  - open-iscsi
+  - nfs-common
+  - python3
+  - python3-pip
+  - python3-kubernetes
+  - fail2ban
+  - ufw
+
+# ==============================================================================
+# Paths
+# ==============================================================================
+
+kubeconfig_local_path: "{{ playbook_dir }}/../kubeconfig"
+k3s_token_path: "/var/lib/rancher/k3s/server/node-token"

@@ -1,0 +1,84 @@
+---
+################################################################################
+# NextOpus - K3s Agent Role
+# Install and configure K3s worker nodes
+################################################################################
+
+- name: Check if K3s is already installed
+  ansible.builtin.stat:
+    path: /usr/local/bin/k3s
+  register: k3s_binary
+
+- name: Get K3s installed version
+  ansible.builtin.command: k3s --version
+  register: k3s_installed_version
+  changed_when: false
+  failed_when: false
+  when: k3s_binary.stat.exists
+
+- name: Download K3s install script
+  ansible.builtin.get_url:
+    url: "{{ k3s_install_script_url }}"
+    dest: /tmp/k3s-install.sh
+    mode: '0755'
+  when: not k3s_binary.stat.exists or k3s_version not in (k3s_installed_version.stdout | default(''))
+
+- name: Get K3s token from control plane
+  ansible.builtin.set_fact:
+    k3s_token: "{{ hostvars[groups['control_plane'][0]]['k3s_token'] }}"
+
+- name: Get control plane private IP
+  ansible.builtin.set_fact:
+    k3s_server_url: "https://{{ hostvars[groups['control_plane'][0]]['private_ip'] }}:6443"
+
+- name: Install K3s agent
+  ansible.builtin.shell: |
+    INSTALL_K3S_VERSION="{{ k3s_version }}" \
+    K3S_URL="{{ k3s_server_url }}" \
+    K3S_TOKEN="{{ k3s_token }}" \
+    INSTALL_K3S_EXEC="agent {{ k3s_agent_args }}" \
+    /tmp/k3s-install.sh
+  args:
+    creates: /usr/local/bin/k3s
+  environment:
+    INSTALL_K3S_SKIP_SELINUX_RPM: "true"
+  register: k3s_agent_install
+  notify: Restart k3s-agent
+
+- name: Wait for k3s-agent service to be active
+  ansible.builtin.systemd:
+    name: k3s-agent
+    state: started
+    enabled: yes
+  register: k3s_agent_service
+  until: k3s_agent_service is succeeded
+  retries: 5
+  delay: 10
+
+- name: Wait for node to register with control plane
+  ansible.builtin.shell: |
+    k3s kubectl get nodes {{ inventory_hostname }} --kubeconfig=/etc/rancher/k3s/k3s.yaml 2>/dev/null || echo "not found"
+  delegate_to: "{{ groups['control_plane'][0] }}"
+  register: node_registered
+  until: "'not found' not in node_registered.stdout"
+  retries: 30
+  delay: 10
+  changed_when: false
+
+- name: Wait for node to be Ready
+  ansible.builtin.shell: |
+    k3s kubectl get nodes {{ inventory_hostname }} -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+  delegate_to: "{{ groups['control_plane'][0] }}"
+  register: node_ready
+  until: node_ready.stdout == "True"
+  retries: 30
+  delay: 10
+  changed_when: false
+
+- name: Label worker node
+  ansible.builtin.command: >
+    k3s kubectl label node {{ inventory_hostname }}
+    node-role.kubernetes.io/worker=true
+    --overwrite
+  delegate_to: "{{ groups['control_plane'][0] }}"
+  changed_when: false

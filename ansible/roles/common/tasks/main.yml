@@ -1,0 +1,107 @@
+---
+################################################################################
+# NextOpus - Common Role
+# Base system configuration for all nodes
+################################################################################
+
+- name: Wait for cloud-init to complete
+  ansible.builtin.command: cloud-init status --wait
+  changed_when: false
+  timeout: 300
+
+- name: Update apt cache
+  ansible.builtin.apt:
+    update_cache: yes
+    cache_valid_time: 3600
+
+- name: Upgrade all packages
+  ansible.builtin.apt:
+    upgrade: dist
+    autoremove: yes
+    autoclean: yes
+  register: apt_upgrade
+  retries: 3
+  delay: 10
+
+- name: Install common packages
+  ansible.builtin.apt:
+    name: "{{ common_packages }}"
+    state: present
+  retries: 3
+  delay: 5
+
+- name: Set timezone
+  community.general.timezone:
+    name: "{{ system_timezone }}"
+
+- name: Disable swap
+  when: disable_swap
+  block:
+    - name: Disable swap immediately
+      ansible.builtin.command: swapoff -a
+      changed_when: false
+
+    - name: Remove swap from fstab
+      ansible.builtin.lineinfile:
+        path: /etc/fstab
+        regexp: '\sswap\s'
+        state: absent
+
+- name: Load required kernel modules
+  community.general.modprobe:
+    name: "{{ item }}"
+    state: present
+    persistent: present
+  loop:
+    - br_netfilter
+    - overlay
+    - ip_vs
+    - ip_vs_rr
+    - ip_vs_wrr
+    - ip_vs_sh
+
+- name: Configure sysctl for Kubernetes
+  ansible.posix.sysctl:
+    name: "{{ item.name }}"
+    value: "{{ item.value }}"
+    sysctl_file: /etc/sysctl.d/99-kubernetes.conf
+    reload: yes
+  loop:
+    - { name: "net.bridge.bridge-nf-call-iptables", value: "1" }
+    - { name: "net.bridge.bridge-nf-call-ip6tables", value: "1" }
+    - { name: "net.ipv4.ip_forward", value: "1" }
+    - { name: "net.ipv4.conf.all.forwarding", value: "1" }
+    - { name: "net.ipv6.conf.all.forwarding", value: "1" }
+    - { name: "vm.swappiness", value: "0" }
+    - { name: "vm.overcommit_memory", value: "1" }
+    - { name: "kernel.panic", value: "10" }
+    - { name: "kernel.panic_on_oops", value: "1" }
+    - { name: "fs.inotify.max_user_watches", value: "524288" }
+    - { name: "fs.inotify.max_user_instances", value: "512" }
+
+- name: Enable and start iscsid (for Longhorn storage)
+  ansible.builtin.systemd:
+    name: iscsid
+    enabled: yes
+    state: started
+
+- name: Set hostname from inventory
+  ansible.builtin.hostname:
+    name: "{{ inventory_hostname }}"
+
+- name: Update /etc/hosts with cluster nodes
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    regexp: ".*{{ hostvars[item]['inventory_hostname'] }}$"
+    line: "{{ hostvars[item]['private_ip'] }} {{ hostvars[item]['inventory_hostname'] }}"
+    state: present
+  loop: "{{ groups['k3s_cluster'] }}"
+
+- name: Create k3s directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: '0755'
+  loop:
+    - /etc/rancher/k3s
+    - /var/lib/rancher/k3s/server/manifests
