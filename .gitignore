@@ -1,0 +1,82 @@
+# Terraform
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/*.tfplan
+terraform/crash.log
+terraform/crash.*.log
+terraform/*.tfvars
+terraform/!*.tfvars.example
+terraform/override.tf
+terraform/override.tf.json
+terraform/*_override.tf
+terraform/*_override.tf.json
+terraform/.terraformrc
+terraform/terraform.rc
+terraform/generated_ssh_key
+terraform/generated_ssh_key.pub
+
+# Ansible
+ansible/*.retry
+ansible/inventory/hosts.yml
+ansible/inventory/hosts.ini
+
+# SSH Keys
+*.pem
+id_rsa*
+!*.pub.example
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+venv/
+.venv/
+ENV/
+
+# Go
+bin/
+pkg/
+
+# Node
+node_modules/
+
+# Build artifacts
+dist/
+build/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Logs
+*.log
+logs/
+
+# Kubernetes
+kubeconfig
+*.kubeconfig
+.kube/
+
+# Secrets (never commit these!)
+secrets/
+credentials/
+*.secret
+*.secrets
