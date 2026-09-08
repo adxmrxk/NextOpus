@@ -33,7 +33,7 @@ Running production-grade Kubernetes is expensive in two ways: cloud bills and op
 NextOpus tackles both problems at once:
 
 - **Zero infrastructure cost.** Oracle Cloud Always Free Tier provides 4 ARM cores and 24 GB of RAM at no charge, indefinitely. NextOpus runs entirely within those limits.
-- **Zero operator toil for common failures.** The Guardian controller watches Prometheus, detects anomalies (crash loops, CPU pressure, memory pressure, service-down conditions, alerts with a `guardian_action` label), and takes the appropriate corrective action: restart the pod, scale the deployment, cordon a node. It honors cooldowns to avoid thrashing, supports a dry-run mode, and surfaces its decisions through Prometheus metrics and an HTTP API.
+- **Zero operator toil for common failures.** The Guardian controller watches Prometheus, detects anomalies (crash loops, CPU pressure, memory pressure, service-down conditions, alerts with a `guardian_action` label), and takes the appropriate corrective action: restart the pod, scale the deployment, cordon a node. Restart and scale-up are driven by the built-in checks; scale-down and node cordoning are reachable only via a Prometheus alert carrying a `guardian_action` label. It honors cooldowns to avoid thrashing, supports a dry-run mode, and surfaces its decisions through Prometheus metrics and an HTTP API.
 
 ### What's On The Platform
 
@@ -75,7 +75,7 @@ The Guardian is the autonomous self-healing controller that gives NextOpus its n
 ### Inspecting the Guardian
 
 ```bash
-kubectl port-forward -n nextopus svc/guardian 8080:8080
+kubectl port-forward -n nextopus-system svc/guardian 8080:8080
 
 curl localhost:8080/health         # Liveness + namespace info
 curl localhost:8080/anomalies      # Currently active anomalies
@@ -218,13 +218,13 @@ The interesting property of this design is that after Phase 3, **the cluster man
 nextopus/
 │
 ├── terraform/                        OCI infrastructure provisioning
-│   ├── main.tf                       Root: composes network, security, compute modules
+│   ├── main.tf                       Root: VCN + composes network, security, compute
 │   ├── providers.tf                  OCI provider config
 │   ├── variables.tf                  Inputs (tenancy OCID, compartment, SSH key, etc.)
 │   ├── outputs.tf                    Instance IPs, kubeconfig hint
 │   ├── terraform.tfvars.example      Template tfvars
 │   └── modules/
-│       ├── network/                  VCN, subnets, route tables, gateways
+│       ├── network/                  Subnets, route tables, gateways
 │       ├── security/                 Security lists, NSGs, K3s firewall rules
 │       └── compute/                  ARM instances + cloud-init + SSH key handling
 │
@@ -275,16 +275,22 @@ nextopus/
 ├── services/                         Demo application source
 │   ├── data-generator/               Go service
 │   │   ├── main.go                   Generator, batcher, HTTP API, Prometheus metrics
+│   │   ├── main_test.go              Config, generation, batching, handler tests
 │   │   ├── Dockerfile
-│   │   └── go.mod
+│   │   ├── go.mod
+│   │   └── go.sum
 │   └── data-processor/               Python service
 │       ├── main.py                   FastAPI: /ingest, /events, /aggregations, /stats
+│       ├── tests/                     Event store and HTTP API tests
+│       ├── pytest.ini
 │       ├── Dockerfile
 │       └── requirements.txt
 │
 ├── scripts/
 │   └── guardian/                     Self-healing controller source
 │       ├── guardian.py               Anomaly detection + remediation + HTTP API
+│       ├── tests/                     Detection, cooldown, remediation, API tests
+│       ├── pytest.ini
 │       ├── Dockerfile
 │       └── requirements.txt
 │
@@ -295,6 +301,7 @@ nextopus/
 │   └── gitops-update.yaml            Push image-tag updates to Kubernetes manifests
 │
 ├── .yamllint.yaml                    YAML lint config
+├── ruff.toml                         Python lint rules (pinned so CI is stable)
 ├── .gitignore
 └── README.md
 ```
@@ -335,8 +342,28 @@ ansible-playbook playbooks/site.yml
 This applies host hardening, installs the K3s server on the control plane, joins the three workers, installs MetalLB, and fetches the kubeconfig locally.
 
 ```bash
-export KUBECONFIG=~/.kube/nextopus.yaml
+export KUBECONFIG=$(pwd)/kubeconfig   # ansible/kubeconfig
 kubectl get nodes
+```
+
+### 2b. Cluster Prerequisites
+
+Create the Grafana admin secret before the observability stack syncs. The
+password is deliberately not committed:
+
+```bash
+kubectl create secret generic grafana-admin -n observability   --from-literal=admin-user=admin   --from-literal=admin-password="$(openssl rand -base64 24)"
+```
+
+Set `metallb_ip_range` in `ansible/group_vars/all.yml` to a free range inside
+your node subnet. It must not overlap an address OCI has assigned to a VNIC.
+
+The ingress hostnames are not real DNS. Point them at the ingress LoadBalancer
+IP in your local hosts file:
+
+```
+<INGRESS_IP>  api.nextopus.local generator.nextopus.local grafana.nextopus.local
+<INGRESS_IP>  argocd.nextopus.local guardian.nextopus.local jaeger.nextopus.local vault.nextopus.local
 ```
 
 ### 3. Hand The Cluster To ArgoCD
@@ -395,8 +422,7 @@ The `.github/workflows/gitops-update.yaml` action closes the loop on image tags:
 
 | Variable           | Description                                | Default |
 |--------------------|--------------------------------------------|---------|
-| `PORT`             | API port                                    | `8080`  |
-| `METRICS_PORT`     | Prometheus scrape port                      | `9090`  |
+| `PORT`             | API port (also serves `/metrics`)           | `8080`  |
 | `MAX_EVENTS`       | In-memory event cap                         | `100000`|
 | `RETENTION_HOURS`  | Drop events older than this many hours      | `24`    |
 | `LOG_LEVEL`        | DEBUG / INFO / WARN / ERROR                 | `INFO`  |
@@ -410,7 +436,6 @@ The `.github/workflows/gitops-update.yaml` action closes the loop on image tags:
 | `CHECK_INTERVAL`               | Seconds between check cycles                | `30`    |
 | `DRY_RUN`                      | Log decisions without acting                | `false` |
 | `CPU_SCALE_UP_THRESHOLD`       | Fraction of CPU limit                       | `0.8`   |
-| `CPU_SCALE_DOWN_THRESHOLD`     | Fraction of CPU limit                       | `0.3`   |
 | `MEMORY_SCALE_UP_THRESHOLD`    | Fraction of memory limit                    | `0.85`  |
 | `RESTART_COUNT_THRESHOLD`      | Restarts/hour before treating as crash loop | `3`     |
 | `ACTION_COOLDOWN`              | Seconds between actions per target          | `300`   |
