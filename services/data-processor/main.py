@@ -4,25 +4,38 @@ Processes incoming data events, provides API for querying, and exposes metrics.
 """
 
 import asyncio
-import json
 import logging
 import os
 import signal
-import sys
 import time
 from collections import defaultdict
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 from contextlib import asynccontextmanager
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
 from starlette.responses import Response
+
+def _utcnow() -> datetime:
+    """Timezone-aware UTC now.
+
+    Incoming events carry tz-aware timestamps (the Go generator sends RFC3339
+    UTC), so every datetime we compare them against must be aware too.
+    """
+    return datetime.now(timezone.utc)
+
+
+def _as_aware(dt: Optional[datetime]) -> Optional[datetime]:
+    """Treat a naive datetime as UTC so comparisons never raise."""
+    if dt is not None and dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
 
 # Configure logging
 logging.basicConfig(
@@ -39,7 +52,6 @@ logger = logging.getLogger(__name__)
 @dataclass
 class Config:
     port: int = int(os.getenv("PORT", "8080"))
-    metrics_port: int = int(os.getenv("METRICS_PORT", "9090"))
     max_events: int = int(os.getenv("MAX_EVENTS", "100000"))
     retention_hours: int = int(os.getenv("RETENTION_HOURS", "24"))
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
@@ -110,14 +122,6 @@ class DataEvent(BaseModel):
     metadata: Optional[Dict[str, str]] = None
 
 
-class EventQuery(BaseModel):
-    type: Optional[str] = None
-    source: Optional[str] = None
-    start_time: Optional[datetime] = None
-    end_time: Optional[datetime] = None
-    limit: int = 100
-
-
 class AggregationResult(BaseModel):
     metric: str
     value: float
@@ -147,7 +151,7 @@ class EventStore:
         self.events_by_source: Dict[str, List[DataEvent]] = defaultdict(list)
         self.max_events = max_events
         self.retention_hours = retention_hours
-        self.start_time = datetime.utcnow()
+        self.start_time = _utcnow()
         self._lock = asyncio.Lock()
 
     async def add_events(self, events: List[DataEvent]) -> int:
@@ -155,6 +159,7 @@ class EventStore:
         async with self._lock:
             added = 0
             for event in events:
+                event.timestamp = _as_aware(event.timestamp)
                 if len(self.events) >= self.max_events:
                     # Remove oldest event
                     old_event = self.events.pop(0)
@@ -178,6 +183,8 @@ class EventStore:
         limit: int = 100
     ) -> List[DataEvent]:
         """Query events with filters."""
+        start_time = _as_aware(start_time)
+        end_time = _as_aware(end_time)
         async with self._lock:
             # Start with appropriate subset
             if event_type:
@@ -189,9 +196,10 @@ class EventStore:
 
             results = []
             for event in reversed(candidates):  # Most recent first
-                if start_time and event.timestamp < start_time:
+                ts = _as_aware(event.timestamp)
+                if start_time and ts < start_time:
                     continue
-                if end_time and event.timestamp > end_time:
+                if end_time and ts > end_time:
                     continue
                 if event_type and event.type != event_type:
                     continue
@@ -219,7 +227,7 @@ class EventStore:
                 events_by_source=events_by_source,
                 oldest_event=oldest,
                 newest_event=newest,
-                uptime_seconds=(datetime.utcnow() - self.start_time).total_seconds()
+                uptime_seconds=(_utcnow() - self.start_time).total_seconds()
             )
 
     async def aggregate_metrics(self, event_type: str = "metric") -> List[AggregationResult]:
@@ -250,7 +258,7 @@ class EventStore:
                         metric=metric,
                         value=agg["sum"] / agg["count"],  # Average
                         count=int(agg["count"]),
-                        timestamp=datetime.utcnow()
+                        timestamp=_utcnow()
                     ))
 
             AGGREGATIONS_COMPUTED.inc()
@@ -259,12 +267,15 @@ class EventStore:
     async def cleanup_old_events(self):
         """Remove events older than retention period."""
         async with self._lock:
-            cutoff = datetime.utcnow() - timedelta(hours=self.retention_hours)
+            cutoff = _utcnow() - timedelta(hours=self.retention_hours)
 
-            # Find cutoff index
-            cutoff_idx = 0
+            # Events are appended in arrival order, so the expired set is a
+            # prefix. Default to len(events): if nothing is inside the retention
+            # window, every event is expired. (Defaulting to 0 meant a fully
+            # expired store evicted nothing.)
+            cutoff_idx = len(self.events)
             for i, event in enumerate(self.events):
-                if event.timestamp >= cutoff:
+                if _as_aware(event.timestamp) >= cutoff:
                     cutoff_idx = i
                     break
 
@@ -345,7 +356,7 @@ async def periodic_cleanup():
 @app.get("/health")
 async def health():
     """Health check endpoint."""
-    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
+    return {"status": "healthy", "timestamp": _utcnow().isoformat()}
 
 
 @app.get("/ready")
