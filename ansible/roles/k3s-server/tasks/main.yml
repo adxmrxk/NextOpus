@@ -113,8 +113,10 @@
     mode: '0644'
 
 - name: Wait for all system pods to be ready
+  # --all includes Completed helm-install job pods, which can never become
+  # Ready, so the field selector skips anything already finished.
   ansible.builtin.shell: |
-    k3s kubectl wait --for=condition=Ready pods --all -n kube-system --timeout=300s
+    k3s kubectl wait --for=condition=Ready pods --all -n kube-system       --field-selector=status.phase!=Succeeded --timeout=300s
   changed_when: false
   retries: 3
   delay: 30

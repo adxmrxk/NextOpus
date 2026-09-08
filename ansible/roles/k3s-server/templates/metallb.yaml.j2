@@ -39,27 +39,59 @@ spec:
           operator: "Exists"
           effect: "NoExecute"
 ---
-# Wait for CRDs to be available before creating IPAddressPool
+# The config Job creates MetalLB CRs, so it needs rights to do so. It ran as the
+# default ServiceAccount before, which has none, and failed on every retry.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: metallb-config
+  namespace: metallb-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: metallb-config
+  namespace: metallb-system
+rules:
+  - apiGroups: ["metallb.io"]
+    resources: ["ipaddresspools", "l2advertisements"]
+    verbs: ["get", "list", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: metallb-config
+  namespace: metallb-system
+subjects:
+  - kind: ServiceAccount
+    name: metallb-config
+    namespace: metallb-system
+roleRef:
+  kind: Role
+  name: metallb-config
+  apiGroup: rbac.authorization.k8s.io
+---
 apiVersion: batch/v1
 kind: Job
 metadata:
   name: metallb-config-setup
   namespace: metallb-system
-  annotations:
-    "helm.sh/hook": post-install,post-upgrade
-    "helm.sh/hook-weight": "1"
 spec:
   template:
     spec:
-      serviceAccountName: default
+      serviceAccountName: metallb-config
       containers:
       - name: kubectl
-        image: bitnami/kubectl:latest
+        image: bitnami/kubectl:1.31.2
         command:
         - /bin/sh
         - -c
         - |
-          sleep 30
+          # Wait for the MetalLB CRDs to be registered by the Helm install.
+          for i in $(seq 1 60); do
+            kubectl get crd ipaddresspools.metallb.io >/dev/null 2>&1 && break
+            sleep 5
+          done
           cat <<EOF | kubectl apply -f -
           apiVersion: metallb.io/v1beta1
           kind: IPAddressPool
@@ -68,10 +100,7 @@ spec:
             namespace: metallb-system
           spec:
             addresses:
-            - {{ hostvars[groups['control_plane'][0]]['private_ip'] }}/32
-          {% for host in groups['workers'] %}
-            - {{ hostvars[host]['private_ip'] }}/32
-          {% endfor %}
+            - {{ metallb_ip_range }}
           ---
           apiVersion: metallb.io/v1beta1
           kind: L2Advertisement
@@ -83,4 +112,4 @@ spec:
             - default-pool
           EOF
       restartPolicy: OnFailure
-  backoffLimit: 4
+  backoffLimit: 6

@@ -31,6 +31,11 @@ cluster_cidr: "10.42.0.0/16"
 service_cidr: "10.43.0.0/16"
 cluster_dns: "10.43.0.10"
 
+# MetalLB L2 pool. Must be a free range inside the node subnet that OCI has not
+# assigned to any VNIC. Using the nodes' own IPs here does not work.
+# Note: L2/ARP announcement is unreliable inside an OCI VCN.
+metallb_ip_range: "10.0.1.200-10.0.1.210"
+
 # ==============================================================================
 # Security Configuration
 # ==============================================================================
