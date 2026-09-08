@@ -5,6 +5,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -27,7 +28,7 @@ import (
 // Configuration from environment variables
 type Config struct {
 	Port              string
-	DataRate          int           // Events per second
+	DataRate          int // Events per second
 	MetricsPort       string
 	ProcessorEndpoint string
 	BatchSize         int
@@ -36,12 +37,12 @@ type Config struct {
 
 // DataEvent represents a generated data event
 type DataEvent struct {
-	ID        string            `json:"id"`
-	Timestamp time.Time         `json:"timestamp"`
-	Type      string            `json:"type"`
-	Source    string            `json:"source"`
+	ID        string                 `json:"id"`
+	Timestamp time.Time              `json:"timestamp"`
+	Type      string                 `json:"type"`
+	Source    string                 `json:"source"`
 	Data      map[string]interface{} `json:"data"`
-	Metadata  map[string]string `json:"metadata"`
+	Metadata  map[string]string      `json:"metadata"`
 }
 
 // Generator handles data generation
@@ -259,7 +260,7 @@ func (g *Generator) flushBuffer() {
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, "POST", g.config.ProcessorEndpoint,
-		json.RawMessage(jsonData))
+		bytes.NewReader(jsonData))
 	if err != nil {
 		log.Printf("Error creating request: %v", err)
 		sendErrors.Inc()
@@ -375,7 +376,8 @@ func (g *Generator) handleGenerate(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	rand.Seed(time.Now().UnixNano())
+	// Go 1.20+ seeds the global rand source automatically; rand.Seed is
+	// deprecated (staticcheck SA1019).
 	config := loadConfig()
 	generator := NewGenerator(config)
 
