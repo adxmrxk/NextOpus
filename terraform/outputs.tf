@@ -145,7 +145,7 @@ output "next_steps" {
        ansible-playbook -i inventory/hosts.yml playbooks/k3s-install.yml
 
     3. Access the K3s cluster:
-       export KUBECONFIG=~/.kube/nextopus-config
+       export KUBECONFIG=$${PWD}/kubeconfig
        kubectl get nodes
 
     Control Plane: ${module.compute.control_plane_public_ip}

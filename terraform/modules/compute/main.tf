@@ -137,16 +137,16 @@ resource "tls_private_key" "ssh" {
 
 # Save generated private key locally
 resource "local_sensitive_file" "ssh_private_key" {
-  count    = var.ssh_public_key == "" ? 1 : 0
-  content  = tls_private_key.ssh[0].private_key_openssh
-  filename = "${path.root}/generated_ssh_key"
+  count           = var.ssh_public_key == "" ? 1 : 0
+  content         = tls_private_key.ssh[0].private_key_openssh
+  filename        = "${path.root}/generated_ssh_key"
   file_permission = "0600"
 }
 
 resource "local_file" "ssh_public_key" {
-  count    = var.ssh_public_key == "" ? 1 : 0
-  content  = tls_private_key.ssh[0].public_key_openssh
-  filename = "${path.root}/generated_ssh_key.pub"
+  count           = var.ssh_public_key == "" ? 1 : 0
+  content         = tls_private_key.ssh[0].public_key_openssh
+  filename        = "${path.root}/generated_ssh_key.pub"
   file_permission = "0644"
 }
 
@@ -223,7 +223,7 @@ resource "oci_core_instance" "control_plane" {
   lifecycle {
     ignore_changes = [
       source_details[0].source_id, # Ignore image updates
-      metadata["user_data"],        # Ignore cloud-init changes
+      metadata["user_data"],       # Ignore cloud-init changes
     ]
   }
 }

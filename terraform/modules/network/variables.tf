@@ -12,6 +12,11 @@ variable "project_name" {
   type        = string
 }
 
+variable "vcn_id" {
+  description = "OCID of the VCN these subnets belong to"
+  type        = string
+}
+
 variable "vcn_cidr" {
   description = "CIDR block for the VCN"
   type        = string

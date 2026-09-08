@@ -4,12 +4,12 @@
 
 output "vcn_id" {
   description = "OCID of the VCN"
-  value       = oci_core_vcn.main.id
+  value       = var.vcn_id
 }
 
 output "vcn_cidr" {
   description = "CIDR block of the VCN"
-  value       = oci_core_vcn.main.cidr_blocks[0]
+  value       = var.vcn_cidr
 }
 
 output "public_subnet_id" {

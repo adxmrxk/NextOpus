@@ -26,6 +26,22 @@ locals {
 }
 
 # ==============================================================================
+# Virtual Cloud Network
+# Declared at the root because both the security and network modules depend on
+# it. Creating it inside the network module produced a module dependency cycle
+# (security needs vcn_id; network's subnets need the security list IDs).
+# ==============================================================================
+
+resource "oci_core_vcn" "main" {
+  compartment_id = local.compartment_ocid
+  cidr_blocks    = [var.vcn_cidr]
+  display_name   = "${var.project_name}-vcn"
+  dns_label      = replace(var.project_name, "-", "")
+
+  freeform_tags = local.common_tags
+}
+
+# ==============================================================================
 # Security Module
 # Must be created first as network module depends on security list IDs
 # ==============================================================================
@@ -34,34 +50,30 @@ module "security" {
   source = "./modules/security"
 
   compartment_ocid = local.compartment_ocid
-  vcn_id           = module.network.vcn_id
+  vcn_id           = oci_core_vcn.main.id
   vcn_cidr         = var.vcn_cidr
   project_name     = var.project_name
   allowed_ssh_cidr = "0.0.0.0/0" # Restrict in production!
   freeform_tags    = local.common_tags
-
-  depends_on = [module.network]
 }
 
 # ==============================================================================
 # Network Module
-# Creates VCN, Subnets, and Gateways
+# Creates Subnets, Gateways, and Route Tables inside the root VCN
 # ==============================================================================
 
 module "network" {
   source = "./modules/network"
 
-  compartment_ocid         = local.compartment_ocid
-  project_name             = var.project_name
-  vcn_cidr                 = var.vcn_cidr
-  public_subnet_cidr       = var.public_subnet_cidr
-  private_subnet_cidr      = var.private_subnet_cidr
-  public_security_list_ids = [module.security.public_security_list_id]
+  compartment_ocid          = local.compartment_ocid
+  project_name              = var.project_name
+  vcn_id                    = oci_core_vcn.main.id
+  vcn_cidr                  = var.vcn_cidr
+  public_subnet_cidr        = var.public_subnet_cidr
+  private_subnet_cidr       = var.private_subnet_cidr
+  public_security_list_ids  = [module.security.public_security_list_id]
   private_security_list_ids = [module.security.private_security_list_id]
-  freeform_tags            = local.common_tags
-
-  # Note: This creates a circular dependency that Terraform handles
-  # by creating the VCN first, then security lists, then subnets
+  freeform_tags             = local.common_tags
 }
 
 # ==============================================================================
@@ -94,7 +106,7 @@ module "compute" {
 
 resource "local_file" "ansible_inventory" {
   filename = "${path.root}/../ansible/inventory/hosts.yml"
-  content  = yamlencode({
+  content = yamlencode({
     all = {
       vars = {
         ansible_user                 = "ubuntu"

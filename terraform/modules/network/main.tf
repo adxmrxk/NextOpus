@@ -4,25 +4,12 @@
 ################################################################################
 
 # ==============================================================================
-# Virtual Cloud Network (VCN)
-# ==============================================================================
-
-resource "oci_core_vcn" "main" {
-  compartment_id = var.compartment_ocid
-  cidr_blocks    = [var.vcn_cidr]
-  display_name   = "${var.project_name}-vcn"
-  dns_label      = replace(var.project_name, "-", "")
-
-  freeform_tags = var.freeform_tags
-}
-
-# ==============================================================================
 # Internet Gateway (for public subnet outbound traffic)
 # ==============================================================================
 
 resource "oci_core_internet_gateway" "main" {
   compartment_id = var.compartment_ocid
-  vcn_id         = oci_core_vcn.main.id
+  vcn_id         = var.vcn_id
   display_name   = "${var.project_name}-igw"
   enabled        = true
 
@@ -37,7 +24,7 @@ resource "oci_core_internet_gateway" "main" {
 
 # resource "oci_core_nat_gateway" "main" {
 #   compartment_id = var.compartment_ocid
-#   vcn_id         = oci_core_vcn.main.id
+#   vcn_id         = var.vcn_id
 #   display_name   = "${var.project_name}-nat"
 #
 #   freeform_tags = var.freeform_tags
@@ -50,7 +37,7 @@ resource "oci_core_internet_gateway" "main" {
 # Public Route Table - routes to Internet Gateway
 resource "oci_core_route_table" "public" {
   compartment_id = var.compartment_ocid
-  vcn_id         = oci_core_vcn.main.id
+  vcn_id         = var.vcn_id
   display_name   = "${var.project_name}-public-rt"
 
   route_rules {
@@ -66,7 +53,7 @@ resource "oci_core_route_table" "public" {
 # Private Route Table - internal only (no NAT in free tier)
 resource "oci_core_route_table" "private" {
   compartment_id = var.compartment_ocid
-  vcn_id         = oci_core_vcn.main.id
+  vcn_id         = var.vcn_id
   display_name   = "${var.project_name}-private-rt"
 
   # No routes - private subnet is isolated
@@ -81,7 +68,7 @@ resource "oci_core_route_table" "private" {
 
 resource "oci_core_dhcp_options" "main" {
   compartment_id = var.compartment_ocid
-  vcn_id         = oci_core_vcn.main.id
+  vcn_id         = var.vcn_id
   display_name   = "${var.project_name}-dhcp"
 
   options {
@@ -104,7 +91,7 @@ resource "oci_core_dhcp_options" "main" {
 # Public Subnet - K3s nodes will be placed here for Always Free Tier
 resource "oci_core_subnet" "public" {
   compartment_id             = var.compartment_ocid
-  vcn_id                     = oci_core_vcn.main.id
+  vcn_id                     = var.vcn_id
   cidr_block                 = var.public_subnet_cidr
   display_name               = "${var.project_name}-public-subnet"
   dns_label                  = "public"
@@ -120,7 +107,7 @@ resource "oci_core_subnet" "public" {
 # Private Subnet - for future database/internal services
 resource "oci_core_subnet" "private" {
   compartment_id             = var.compartment_ocid
-  vcn_id                     = oci_core_vcn.main.id
+  vcn_id                     = var.vcn_id
   cidr_block                 = var.private_subnet_cidr
   display_name               = "${var.project_name}-private-subnet"
   dns_label                  = "private"
