@@ -1,0 +1,8 @@
+# Normalise line endings. Without this, core.autocrlf=true hands Windows
+# clones CRLF files and the repo's own yamllint fails on the new-lines rule.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.gz  binary
+*.zip binary
