@@ -30,7 +30,7 @@ metadata:
 spec:
   project: nextopus
   source:
-    repoURL: https://github.com/YOUR_USERNAME/nextopus.git  # Update with your repo
+    repoURL: https://github.com/adxmrxk/NextOpus.git
     targetRevision: main
     path: kubernetes/argocd/applications
     directory:

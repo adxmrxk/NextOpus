@@ -71,7 +71,7 @@ spec:
         fsGroup: 1000
       containers:
         - name: guardian
-          image: ghcr.io/nextopus/guardian:latest
+          image: ghcr.io/adxmrxk/guardian:latest
           imagePullPolicy: Always
           ports:
             - name: http
@@ -128,11 +128,16 @@ metadata:
   namespace: nextopus-system
   labels:
     app: guardian
+    app.kubernetes.io/name: guardian
+    app.kubernetes.io/part-of: nextopus-platform
 spec:
   type: ClusterIP
   ports:
     - name: http
       port: 8080
+      targetPort: http
+    - name: metrics
+      port: 9090
       targetPort: http
   selector:
     app: guardian

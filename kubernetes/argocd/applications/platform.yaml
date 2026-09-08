@@ -11,7 +11,7 @@ metadata:
 spec:
   project: nextopus
   source:
-    repoURL: https://github.com/YOUR_USERNAME/nextopus.git
+    repoURL: https://github.com/adxmrxk/NextOpus.git
     targetRevision: main
     path: kubernetes/platform/vault
   destination:
@@ -34,7 +34,7 @@ metadata:
 spec:
   project: nextopus
   source:
-    repoURL: https://github.com/YOUR_USERNAME/nextopus.git
+    repoURL: https://github.com/adxmrxk/NextOpus.git
     targetRevision: main
     path: kubernetes/platform/istio
   destination:
@@ -57,7 +57,7 @@ metadata:
 spec:
   project: nextopus
   source:
-    repoURL: https://github.com/YOUR_USERNAME/nextopus.git
+    repoURL: https://github.com/adxmrxk/NextOpus.git
     targetRevision: main
     path: kubernetes/platform/kyverno
   destination:
@@ -80,7 +80,7 @@ metadata:
 spec:
   project: nextopus
   source:
-    repoURL: https://github.com/YOUR_USERNAME/nextopus.git
+    repoURL: https://github.com/adxmrxk/NextOpus.git
     targetRevision: main
     path: kubernetes/platform/jaeger
   destination:

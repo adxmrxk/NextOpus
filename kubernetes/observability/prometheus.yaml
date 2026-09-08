@@ -70,7 +70,12 @@ spec:
 
     grafana:
       enabled: true
-      adminPassword: "NextOpus2024!"  # Change in production!
+      # Do not commit a password. Create the secret on the cluster first:
+      #   kubectl create secret generic grafana-admin -n observability       #     --from-literal=admin-user=admin       #     --from-literal=admin-password="$(openssl rand -base64 24)"
+      admin:
+        existingSecret: grafana-admin
+        userKey: admin-user
+        passwordKey: admin-password
       resources:
         requests:
           cpu: 50m
@@ -81,11 +86,10 @@ spec:
       persistence:
         enabled: true
         size: 2Gi
+      # Ingress is defined in platform/nginx-ingress/ingress-rules.yaml.
+      # Traefik is disabled on this cluster (--disable traefik).
       ingress:
-        enabled: true
-        ingressClassName: traefik
-        hosts:
-          - grafana.nextopus.local
+        enabled: false
       dashboardProviders:
         dashboardproviders.yaml:
           apiVersion: 1

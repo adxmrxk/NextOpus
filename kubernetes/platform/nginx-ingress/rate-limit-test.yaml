@@ -18,14 +18,14 @@ spec:
             - -c
             - |
               echo "=== Rate Limit Test ==="
-              echo "Sending 200 requests rapidly to trigger rate limiting..."
+              echo "Sending 200 requests through the nginx ingress to trigger rate limiting..."
               echo ""
 
               SUCCESS=0
               RATE_LIMITED=0
 
               for i in $(seq 1 200); do
-                RESPONSE=$(wget -q -O /dev/null -S http://data-processor.nextopus.svc.cluster.local:8080/health 2>&1 | grep "HTTP/" | awk '{print $2}')
+                RESPONSE=$(wget -q -O /dev/null -S --header="Host: api.nextopus.local" \n                  http://ingress-nginx-controller.ingress-nginx.svc.cluster.local/health 2>&1 \n                  | grep "HTTP/" | awk '{print $2}')
 
                 if [ "$RESPONSE" = "200" ]; then
                   SUCCESS=$((SUCCESS + 1))

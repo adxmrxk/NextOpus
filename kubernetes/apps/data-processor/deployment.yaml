@@ -38,7 +38,7 @@ spec:
         fsGroup: 1000
       containers:
         - name: data-processor
-          image: ghcr.io/nextopus/data-processor:latest
+          image: ghcr.io/adxmrxk/data-processor:latest
           imagePullPolicy: Always
           ports:
             - name: http
@@ -114,6 +114,8 @@ metadata:
   namespace: nextopus
   labels:
     app: data-processor
+    app.kubernetes.io/name: data-processor
+    app.kubernetes.io/part-of: nextopus-platform
 spec:
   type: ClusterIP
   ports:
@@ -121,47 +123,12 @@ spec:
       port: 8080
       targetPort: http
       protocol: TCP
+    - name: metrics
+      port: 9090
+      targetPort: http
+      protocol: TCP
   selector:
     app: data-processor
----
-apiVersion: autoscaling/v2
-kind: HorizontalPodAutoscaler
-metadata:
-  name: data-processor
-  namespace: nextopus
-spec:
-  scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
-    name: data-processor
-  minReplicas: 2
-  maxReplicas: 6
-  metrics:
-    - type: Resource
-      resource:
-        name: cpu
-        target:
-          type: Utilization
-          averageUtilization: 70
-    - type: Resource
-      resource:
-        name: memory
-        target:
-          type: Utilization
-          averageUtilization: 75
-  behavior:
-    scaleDown:
-      stabilizationWindowSeconds: 300
-      policies:
-        - type: Percent
-          value: 10
-          periodSeconds: 60
-    scaleUp:
-      stabilizationWindowSeconds: 60
-      policies:
-        - type: Percent
-          value: 100
-          periodSeconds: 15
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget
@@ -173,26 +140,3 @@ spec:
   selector:
     matchLabels:
       app: data-processor
----
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: data-processor
-  namespace: nextopus
-  labels:
-    app: data-processor
-  annotations:
-    kubernetes.io/ingress.class: traefik
-    traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
-spec:
-  rules:
-    - host: api.nextopus.local
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: data-processor
-                port:
-                  number: 8080

@@ -139,10 +139,8 @@ spec:
   namespaceSelector:
     matchNames:
       - nextopus
+      - nextopus-system
   endpoints:
     - port: metrics
-      interval: 15s
-      path: /metrics
-    - port: http
       interval: 15s
       path: /metrics

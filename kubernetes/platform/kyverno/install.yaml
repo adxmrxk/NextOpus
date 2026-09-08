@@ -106,13 +106,30 @@ spec:
           - resources:
               kinds:
                 - Pod
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - kube-public
+                - kube-node-lease
+                - metallb-system
+                - istio-system
+                - kyverno
+                - ingress-nginx
       validate:
         message: "Privileged containers are not allowed."
         pattern:
           spec:
+            =(initContainers):
+              - =(securityContext):
+                  =(privileged): "false"
+            =(ephemeralContainers):
+              - =(securityContext):
+                  =(privileged): "false"
             containers:
-              - securityContext:
-                  privileged: "false"
+              - =(securityContext):
+                  =(privileged): "false"
 ---
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy

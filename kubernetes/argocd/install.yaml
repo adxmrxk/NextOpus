@@ -45,13 +45,10 @@ spec:
           memory: 256Mi
       extraArgs:
         - --insecure  # Disable TLS (handle at ingress level)
+      # Ingress is defined in platform/nginx-ingress/ingress-rules.yaml.
+      # Traefik is disabled on this cluster (--disable traefik).
       ingress:
-        enabled: true
-        ingressClassName: traefik
-        hosts:
-          - argocd.nextopus.local
-        annotations:
-          traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
+        enabled: false
 
     repoServer:
       replicas: 1

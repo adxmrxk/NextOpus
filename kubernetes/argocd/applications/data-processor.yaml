@@ -9,7 +9,7 @@ metadata:
 spec:
   project: nextopus
   source:
-    repoURL: https://github.com/YOUR_USERNAME/nextopus.git
+    repoURL: https://github.com/adxmrxk/NextOpus.git
     targetRevision: main
     path: kubernetes/apps/data-processor
   destination:
