@@ -68,6 +68,7 @@ kind: ClusterPolicy
 metadata:
   name: require-labels
   annotations:
+    argocd.argoproj.io/sync-wave: "1"
     policies.kyverno.io/title: Require Labels
     policies.kyverno.io/description: Require app and version labels on all pods
 spec:
@@ -94,6 +95,7 @@ kind: ClusterPolicy
 metadata:
   name: disallow-privileged
   annotations:
+    argocd.argoproj.io/sync-wave: "1"
     policies.kyverno.io/title: Disallow Privileged Containers
     policies.kyverno.io/description: Disallow running containers in privileged mode
 spec:
@@ -136,6 +138,7 @@ kind: ClusterPolicy
 metadata:
   name: require-run-as-non-root
   annotations:
+    argocd.argoproj.io/sync-wave: "1"
     policies.kyverno.io/title: Require runAsNonRoot
     policies.kyverno.io/description: Require containers to run as non-root user
 spec:
@@ -162,6 +165,7 @@ kind: ClusterPolicy
 metadata:
   name: require-resource-limits
   annotations:
+    argocd.argoproj.io/sync-wave: "1"
     policies.kyverno.io/title: Require Resource Limits
     policies.kyverno.io/description: Require CPU and memory limits on all containers
 spec:
@@ -191,6 +195,7 @@ kind: ClusterPolicy
 metadata:
   name: require-probes
   annotations:
+    argocd.argoproj.io/sync-wave: "1"
     policies.kyverno.io/title: Require Health Probes
     policies.kyverno.io/description: Require liveness and readiness probes
 spec:
@@ -224,6 +229,7 @@ kind: ClusterPolicy
 metadata:
   name: add-default-securitycontext
   annotations:
+    argocd.argoproj.io/sync-wave: "1"
     policies.kyverno.io/title: Add Default Security Context
     policies.kyverno.io/description: Mutate pods to add security context if missing
 spec:

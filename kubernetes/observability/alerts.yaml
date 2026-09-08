@@ -3,6 +3,8 @@
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
 metadata:
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
   name: nextopus-alerts
   namespace: observability
   labels:
@@ -128,6 +130,8 @@ spec:
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
   name: nextopus-apps
   namespace: observability
   labels:
