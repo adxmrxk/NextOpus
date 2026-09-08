@@ -38,7 +38,7 @@ spec:
         fsGroup: 1000
       containers:
         - name: data-generator
-          image: ghcr.io/adxmrxk/data-generator:latest
+          image: ghcr.io/adxmrxk/data-generator:66e2ddd
           imagePullPolicy: Always
           ports:
             - name: http
