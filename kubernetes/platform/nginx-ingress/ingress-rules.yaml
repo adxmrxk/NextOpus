@@ -12,6 +12,7 @@ metadata:
   name: data-processor-api
   namespace: nextopus
   annotations:
+    argocd.argoproj.io/sync-wave: "1"
     kubernetes.io/ingress.class: nginx
 
     # Rate limiting - 100 req/sec with burst of 200
@@ -19,9 +20,10 @@ metadata:
     nginx.ingress.kubernetes.io/limit-burst-multiplier: "2"
     nginx.ingress.kubernetes.io/limit-connections: "50"
 
-    # Custom error pages for rate limiting
-    nginx.ingress.kubernetes.io/custom-http-errors: "429,503"
-    nginx.ingress.kubernetes.io/default-backend: ingress-nginx-defaultbackend
+    # No custom-http-errors here. Routing 429 to the default backend turns it
+    # into a 404, so clients never see the rate limit, the rate-limit test job
+    # cannot detect it, and the HighRateLimitHits alert (which keys on
+    # status="429") can never fire.
 
     # Timeouts
     nginx.ingress.kubernetes.io/proxy-connect-timeout: "10"
@@ -64,6 +66,7 @@ metadata:
   name: data-processor-ingest
   namespace: nextopus
   annotations:
+    argocd.argoproj.io/sync-wave: "1"
     kubernetes.io/ingress.class: nginx
 
     # Higher rate limit for ingest endpoint
@@ -101,6 +104,7 @@ metadata:
   name: data-generator-stats
   namespace: nextopus
   annotations:
+    argocd.argoproj.io/sync-wave: "1"
     kubernetes.io/ingress.class: nginx
 
     # Lower rate limit for stats
@@ -134,6 +138,7 @@ metadata:
   name: grafana
   namespace: observability
   annotations:
+    argocd.argoproj.io/sync-wave: "1"
     kubernetes.io/ingress.class: nginx
 
     nginx.ingress.kubernetes.io/limit-rps: "30"
@@ -167,6 +172,7 @@ metadata:
   name: argocd
   namespace: argocd
   annotations:
+    argocd.argoproj.io/sync-wave: "1"
     kubernetes.io/ingress.class: nginx
 
     nginx.ingress.kubernetes.io/limit-rps: "20"
@@ -201,6 +207,7 @@ metadata:
   name: guardian
   namespace: nextopus-system
   annotations:
+    argocd.argoproj.io/sync-wave: "1"
     kubernetes.io/ingress.class: nginx
 
     # Very strict rate limiting for admin endpoint

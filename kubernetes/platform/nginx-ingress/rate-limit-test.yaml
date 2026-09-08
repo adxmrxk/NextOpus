@@ -4,12 +4,19 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
   name: rate-limit-test
   namespace: nextopus
 spec:
   ttlSecondsAfterFinished: 300
   template:
     spec:
+      # The add-default-securitycontext policy injects runAsNonRoot, and busybox
+      # runs as root by default, so without this the job never starts.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
       containers:
         - name: load-test
           image: busybox:1.36
@@ -17,36 +24,48 @@ spec:
             - /bin/sh
             - -c
             - |
+              INGRESS=http://ingress-nginx-controller.ingress-nginx.svc.cluster.local/health
+              HOST=api.nextopus.local
+              TOTAL=800
+
               echo "=== Rate Limit Test ==="
-              echo "Sending 200 requests through the nginx ingress to trigger rate limiting..."
+              echo "Sending $TOTAL concurrent requests through the nginx ingress."
+              echo "The ingress allows 100 r/s with a burst of 200, so most of these"
+              echo "should come back 429."
               echo ""
 
-              SUCCESS=0
-              RATE_LIMITED=0
-
-              for i in $(seq 1 200); do
-                RESPONSE=$(wget -q -O /dev/null -S --header="Host: api.nextopus.local" \n                  http://ingress-nginx-controller.ingress-nginx.svc.cluster.local/health 2>&1 \n                  | grep "HTTP/" | awk '{print $2}')
-
-                if [ "$RESPONSE" = "200" ]; then
-                  SUCCESS=$((SUCCESS + 1))
-                elif [ "$RESPONSE" = "429" ]; then
-                  RATE_LIMITED=$((RATE_LIMITED + 1))
-                fi
-
-                # No delay - burst as fast as possible
+              # Requests must be concurrent. Sent one at a time they never reach
+              # 100 r/s, so the limiter is never tripped and the test looks green
+              # when it has proved nothing.
+              i=0
+              while [ $i -lt $TOTAL ]; do
+                wget -q -O /dev/null -S --header="Host: $HOST" "$INGRESS" 2>>/tmp/out &
+                i=$((i + 1))
               done
+              wait
 
-              echo ""
+              SUCCESS=$(grep -c "HTTP/1.1 200" /tmp/out 2>/dev/null || echo 0)
+              RATE_LIMITED=$(grep -c "HTTP/1.1 429" /tmp/out 2>/dev/null || echo 0)
+
               echo "=== Results ==="
               echo "Successful (200): $SUCCESS"
               echo "Rate Limited (429): $RATE_LIMITED"
               echo ""
 
-              if [ $RATE_LIMITED -gt 0 ]; then
+              if [ "$RATE_LIMITED" -gt 0 ]; then
                 echo "Rate limiting is WORKING"
               else
-                echo "Rate limiting may not be configured (all requests succeeded)"
+                echo "Rate limiting did NOT trigger"
+                exit 1
               fi
+          # add-default-securitycontext injects readOnlyRootFilesystem, so the
+          # script needs a writable scratch mount.
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
       restartPolicy: Never
   backoffLimit: 1
 ---
@@ -54,6 +73,8 @@ spec:
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
 metadata:
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
   name: nginx-rate-limit-alerts
   namespace: observability
   labels:
