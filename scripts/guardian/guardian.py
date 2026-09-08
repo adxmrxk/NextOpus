@@ -14,20 +14,16 @@ The Guardian is the "immune system" of the NextOpus platform.
 """
 
 import asyncio
-import json
 import logging
 import os
 import signal
-import sys
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Optional, Set
-from collections import defaultdict
+from typing import Any, Dict, List, Optional
 
 import httpx
 from kubernetes import client, config
-from kubernetes.client.rest import ApiException
 from prometheus_client import Counter, Gauge, Histogram, generate_latest, CONTENT_TYPE_LATEST
 from aiohttp import web
 
@@ -53,7 +49,6 @@ class GuardianConfig:
 
     # Thresholds
     cpu_scale_up_threshold: float = float(os.getenv("CPU_SCALE_UP_THRESHOLD", "0.8"))
-    cpu_scale_down_threshold: float = float(os.getenv("CPU_SCALE_DOWN_THRESHOLD", "0.3"))
     memory_scale_up_threshold: float = float(os.getenv("MEMORY_SCALE_UP_THRESHOLD", "0.85"))
     restart_count_threshold: int = int(os.getenv("RESTART_COUNT_THRESHOLD", "3"))
 
@@ -110,8 +105,6 @@ class ActionType(Enum):
     SCALE_UP = "scale_up"
     SCALE_DOWN = "scale_down"
     CORDON_NODE = "cordon_node"
-    UNCORDON_NODE = "uncordon_node"
-    DELETE_POD = "delete_pod"
 
 
 class Severity(Enum):
@@ -170,36 +163,6 @@ class PrometheusClient:
                 return []
         except Exception as e:
             logger.error(f"Prometheus query error: {e}")
-            return []
-
-    async def query_range(
-        self,
-        promql: str,
-        start: datetime,
-        end: datetime,
-        step: str = "1m"
-    ) -> List[Dict[str, Any]]:
-        """Execute a PromQL range query."""
-        try:
-            response = await self.client.get(
-                f"{self.url}/api/v1/query_range",
-                params={
-                    "query": promql,
-                    "start": start.isoformat() + "Z",
-                    "end": end.isoformat() + "Z",
-                    "step": step
-                }
-            )
-            response.raise_for_status()
-            data = response.json()
-
-            if data["status"] == "success":
-                return data["data"]["result"]
-            else:
-                logger.error(f"Prometheus range query failed: {data}")
-                return []
-        except Exception as e:
-            logger.error(f"Prometheus range query error: {e}")
             return []
 
     async def get_alerts(self) -> List[Dict[str, Any]]:
@@ -265,17 +228,24 @@ class KubernetesController:
             action.result = f"Pod {name} deleted for restart"
             logger.info(f"Restarted pod {namespace}/{name}")
             ACTIONS_TAKEN.labels(action="restart_pod", target=namespace).inc()
-        except ApiException as e:
-            action.result = f"Failed to restart pod: {e.reason}"
+        except Exception as e:
+            reason = getattr(e, "reason", e)
+            action.result = f"Failed to restart pod: {reason}"
             logger.error(f"Failed to restart pod {namespace}/{name}: {e}")
             ACTIONS_FAILED.labels(action="restart_pod", target=namespace).inc()
 
         return action
 
-    def scale_deployment(self, name: str, namespace: str, replicas: int) -> Action:
+    def scale_deployment(
+        self,
+        name: str,
+        namespace: str,
+        replicas: int,
+        action_type: ActionType = ActionType.SCALE_UP,
+    ) -> Action:
         """Scale a deployment to specified replicas."""
         action = Action(
-            type=ActionType.SCALE_UP if replicas > 0 else ActionType.SCALE_DOWN,
+            type=action_type,
             target=f"{namespace}/{name}",
             reason=f"Scaling to {replicas} replicas"
         )
@@ -299,8 +269,9 @@ class KubernetesController:
             action.result = f"Scaled from {current_replicas} to {replicas}"
             logger.info(f"Scaled {namespace}/{name} from {current_replicas} to {replicas}")
             ACTIONS_TAKEN.labels(action="scale", target=namespace).inc()
-        except ApiException as e:
-            action.result = f"Failed to scale: {e.reason}"
+        except Exception as e:
+            reason = getattr(e, "reason", e)
+            action.result = f"Failed to scale: {reason}"
             logger.error(f"Failed to scale {namespace}/{name}: {e}")
             ACTIONS_FAILED.labels(action="scale", target=namespace).inc()
 
@@ -315,7 +286,7 @@ class KubernetesController:
                 deployment.spec.replicas,
                 deployment.status.replicas or 0
             )
-        except ApiException as e:
+        except Exception as e:
             logger.error(f"Failed to get deployment info: {e}")
             return (0, 0, 0)
 
@@ -339,8 +310,9 @@ class KubernetesController:
             action.result = f"Node {name} cordoned"
             logger.info(f"Cordoned node {name}")
             ACTIONS_TAKEN.labels(action="cordon", target="node").inc()
-        except ApiException as e:
-            action.result = f"Failed to cordon: {e.reason}"
+        except Exception as e:
+            reason = getattr(e, "reason", e)
+            action.result = f"Failed to cordon: {reason}"
             logger.error(f"Failed to cordon {name}: {e}")
             ACTIONS_FAILED.labels(action="cordon", target="node").inc()
 
@@ -354,7 +326,7 @@ class KubernetesController:
                 label_selector=label_selector
             )
             return pods.items
-        except ApiException as e:
+        except Exception as e:
             logger.error(f"Failed to list pods: {e}")
             return []
 
@@ -569,20 +541,28 @@ class Guardian:
         elif anomaly.suggested_action == ActionType.SCALE_UP:
             deployment = self.get_deployment_for_pod(target)
             if deployment:
-                ready, desired, _ = self.k8s.get_deployment_replicas(deployment, self.config.namespace)
+                _, desired, _ = self.k8s.get_deployment_replicas(deployment, self.config.namespace)
                 # Scale up by 1, max 10
                 new_replicas = min(desired + 1, 10)
                 if new_replicas > desired:
-                    action = self.k8s.scale_deployment(deployment, self.config.namespace, new_replicas)
+                    action = self.k8s.scale_deployment(
+                        deployment, self.config.namespace, new_replicas, ActionType.SCALE_UP
+                    )
+
+        elif anomaly.suggested_action == ActionType.CORDON_NODE:
+            node = anomaly.metadata.get("node") or target
+            action = self.k8s.cordon_node(node)
 
         elif anomaly.suggested_action == ActionType.SCALE_DOWN:
             deployment = self.get_deployment_for_pod(target)
             if deployment:
-                ready, desired, _ = self.k8s.get_deployment_replicas(deployment, self.config.namespace)
+                _, desired, _ = self.k8s.get_deployment_replicas(deployment, self.config.namespace)
                 # Scale down by 1, min 1
                 new_replicas = max(desired - 1, 1)
                 if new_replicas < desired:
-                    action = self.k8s.scale_deployment(deployment, self.config.namespace, new_replicas)
+                    action = self.k8s.scale_deployment(
+                        deployment, self.config.namespace, new_replicas, ActionType.SCALE_DOWN
+                    )
 
         if action and action.success:
             self.record_action(target, is_scale)
@@ -635,7 +615,11 @@ class Guardian:
             # Take remediation actions
             for anomaly in all_anomalies:
                 logger.info(f"Anomaly: {anomaly.type} on {anomaly.target}: {anomaly.message}")
-                action = await self.remediate(anomaly)
+                try:
+                    action = await self.remediate(anomaly)
+                except Exception as e:
+                    logger.error(f"Remediation failed for {anomaly.target}: {e}")
+                    continue
                 if action:
                     logger.info(f"Action taken: {action.type.value} on {action.target}: {action.result}")
         else:
@@ -659,7 +643,7 @@ class Guardian:
             try:
                 await self.run_check_cycle()
             except Exception as e:
-                logger.error(f"Check cycle failed: {e}", exc_info=True)
+                logger.exception(f"Check cycle failed: {e}")
                 HEALTH_STATUS.set(0)
 
             await asyncio.sleep(self.config.check_interval)
@@ -689,9 +673,11 @@ async def create_app(guardian: Guardian) -> web.Application:
         })
 
     async def metrics(request):
+        # CONTENT_TYPE_LATEST carries a charset, which aiohttp refuses in the
+        # content_type argument; set it as a raw header instead.
         return web.Response(
             body=generate_latest(),
-            content_type=CONTENT_TYPE_LATEST
+            headers={"Content-Type": CONTENT_TYPE_LATEST}
         )
 
     async def anomalies(request):
