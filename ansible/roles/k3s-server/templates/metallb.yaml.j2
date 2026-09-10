@@ -57,6 +57,30 @@ rules:
     resources: ["ipaddresspools", "l2advertisements"]
     verbs: ["get", "list", "create", "update", "patch"]
 ---
+# The readiness check is `kubectl get crd`, which is cluster scoped, so the
+# namespaced Role above is not enough on its own.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: metallb-config-crd-reader
+rules:
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: metallb-config-crd-reader
+subjects:
+  - kind: ServiceAccount
+    name: metallb-config
+    namespace: metallb-system
+roleRef:
+  kind: ClusterRole
+  name: metallb-config-crd-reader
+  apiGroup: rbac.authorization.k8s.io
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
@@ -82,7 +106,9 @@ spec:
       serviceAccountName: metallb-config
       containers:
       - name: kubectl
-        image: bitnami/kubectl:1.31.2
+        # bitnami/kubectl tags were retired from Docker Hub. rancher/kubectl
+        # has no shell, and this script needs one, so use alpine/k8s.
+        image: alpine/k8s:1.31.2
         command:
         - /bin/sh
         - -c
