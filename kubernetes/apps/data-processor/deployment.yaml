@@ -53,6 +53,10 @@ spec:
               value: "12"
             - name: LOG_LEVEL
               value: "INFO"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://jaeger-collector.observability.svc.cluster.local:4318"
+            - name: OTEL_SERVICE_NAME
+              value: "data-processor"
           resources:
             requests:
               cpu: 100m

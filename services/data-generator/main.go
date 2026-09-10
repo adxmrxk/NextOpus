@@ -23,6 +23,11 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // Configuration from environment variables
@@ -33,6 +38,8 @@ type Config struct {
 	ProcessorEndpoint string
 	BatchSize         int
 	FlushInterval     time.Duration
+	OTLPEndpoint      string // empty disables tracing
+	ServiceName       string
 }
 
 // DataEvent represents a generated data event
@@ -142,6 +149,11 @@ func loadConfig() Config {
 		processorEndpoint = "http://data-processor:8080/ingest"
 	}
 
+	serviceName := os.Getenv("OTEL_SERVICE_NAME")
+	if serviceName == "" {
+		serviceName = "data-generator"
+	}
+
 	return Config{
 		Port:              port,
 		DataRate:          dataRate,
@@ -149,6 +161,8 @@ func loadConfig() Config {
 		ProcessorEndpoint: processorEndpoint,
 		BatchSize:         batchSize,
 		FlushInterval:     time.Duration(flushIntervalMs) * time.Millisecond,
+		OTLPEndpoint:      os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
+		ServiceName:       serviceName,
 	}
 }
 
@@ -158,11 +172,14 @@ func NewGenerator(config Config) *Generator {
 		buffer: make([]DataEvent, 0, config.BatchSize*2),
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
-			Transport: &http.Transport{
+			// otelhttp injects W3C tracecontext headers on every request, which
+			// is what lets the processor continue this trace instead of
+			// starting a disconnected one.
+			Transport: otelhttp.NewTransport(&http.Transport{
 				MaxIdleConns:        100,
 				MaxIdleConnsPerHost: 100,
 				IdleConnTimeout:     90 * time.Second,
-			},
+			}),
 		},
 		eventTypes: []string{
 			"metric", "log", "trace", "alert", "audit", "heartbeat",
@@ -249,21 +266,37 @@ func (g *Generator) flushBuffer() {
 
 	batchSize.Observe(float64(len(batch)))
 
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Root span for this batch. Everything the processor does lands underneath
+	// it, so one trace shows the whole journey across both services.
+	ctx, span := otel.Tracer(tracerName).Start(ctx, "flush_batch",
+		trace.WithSpanKind(trace.SpanKindProducer),
+		trace.WithAttributes(
+			attribute.Int("batch.size", len(batch)),
+			attribute.String("processor.endpoint", g.config.ProcessorEndpoint),
+		),
+	)
+	defer span.End()
+
 	jsonData, err := json.Marshal(batch)
 	if err != nil {
 		log.Printf("Error marshaling batch: %v", err)
 		sendErrors.Inc()
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "marshal failed")
 		return
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	span.SetAttributes(attribute.Int("batch.bytes", len(jsonData)))
 
 	req, err := http.NewRequestWithContext(ctx, "POST", g.config.ProcessorEndpoint,
 		bytes.NewReader(jsonData))
 	if err != nil {
 		log.Printf("Error creating request: %v", err)
 		sendErrors.Inc()
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "request build failed")
 		return
 	}
 
@@ -273,15 +306,21 @@ func (g *Generator) flushBuffer() {
 	if err != nil {
 		log.Printf("Error sending batch: %v", err)
 		sendErrors.Inc()
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "send failed")
 		return
 	}
 	defer resp.Body.Close()
 
+	span.SetAttributes(attribute.Int("http.status_code", resp.StatusCode))
+
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		eventsSent.Add(float64(len(batch)))
+		span.SetStatus(codes.Ok, "")
 	} else {
 		log.Printf("Processor returned status %d", resp.StatusCode)
 		sendErrors.Inc()
+		span.SetStatus(codes.Error, fmt.Sprintf("processor returned %d", resp.StatusCode))
 	}
 }
 
@@ -379,11 +418,17 @@ func main() {
 	// Go 1.20+ seeds the global rand source automatically; rand.Seed is
 	// deprecated (staticcheck SA1019).
 	config := loadConfig()
-	generator := NewGenerator(config)
 
 	// Context for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	shutdownTracing, err := initTracing(ctx, config)
+	if err != nil {
+		log.Printf("Tracing setup failed, continuing without it: %v", err)
+	}
+
+	generator := NewGenerator(config)
 
 	// HTTP server for API
 	mux := http.NewServeMux()
@@ -438,6 +483,11 @@ func main() {
 
 	apiServer.Shutdown(shutdownCtx)
 	metricsServer.Shutdown(shutdownCtx)
+
+	// Flush any spans still sitting in the batch processor.
+	if err := shutdownTracing(shutdownCtx); err != nil {
+		log.Printf("Tracing shutdown error: %v", err)
+	}
 
 	log.Println("Shutdown complete")
 }

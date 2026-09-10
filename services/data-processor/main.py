@@ -21,6 +21,8 @@ from pydantic import BaseModel
 from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
 from starlette.responses import Response
 
+from tracing import get_tracer, instrument_app, setup_tracing
+
 def _utcnow() -> datetime:
     """Timezone-aware UTC now.
 
@@ -302,6 +304,9 @@ store = EventStore(config.max_events, config.retention_hours)
 shutdown_event = asyncio.Event()
 
 
+setup_tracing()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
@@ -326,6 +331,8 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan
 )
+
+instrument_app(app)
 
 app.add_middleware(
     CORSMiddleware,
@@ -370,13 +377,19 @@ async def ingest_events(events: List[DataEvent]):
     """Ingest a batch of events."""
     start_time = time.time()
 
+    tracer = get_tracer()
     try:
         BATCH_SIZE.observe(len(events))
 
-        for event in events:
-            EVENTS_RECEIVED.labels(type=event.type, source=event.source).inc()
+        with tracer.start_as_current_span("count_events") as span:
+            span.set_attribute("batch.size", len(events))
+            for event in events:
+                EVENTS_RECEIVED.labels(type=event.type, source=event.source).inc()
 
-        added = await store.add_events(events)
+        with tracer.start_as_current_span("store_events") as span:
+            added = await store.add_events(events)
+            span.set_attribute("events.added", added)
+            span.set_attribute("store.total", len(store.events))
         EVENTS_PROCESSED.inc(added)
 
         PROCESSING_LATENCY.observe(time.time() - start_time)
@@ -401,14 +414,22 @@ async def query_events(
     limit: int = Query(100, ge=1, le=1000, description="Max results")
 ):
     """Query events with filters."""
+    tracer = get_tracer()
     try:
-        events = await store.query(
-            event_type=type,
-            source=source,
-            start_time=start,
-            end_time=end,
-            limit=limit
-        )
+        with tracer.start_as_current_span("query_events") as span:
+            span.set_attribute("query.limit", limit)
+            if type:
+                span.set_attribute("query.type", type)
+            if source:
+                span.set_attribute("query.source", source)
+            events = await store.query(
+                event_type=type,
+                source=source,
+                start_time=start,
+                end_time=end,
+                limit=limit
+            )
+            span.set_attribute("query.results", len(events))
         return {"events": events, "count": len(events)}
     except Exception as e:
         logger.error(f"Query error: {e}")

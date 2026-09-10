@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -273,5 +274,78 @@ func TestGenerateEventCarriesEnvironmentMetadata(t *testing.T) {
 	}
 	if e.Metadata["generator_id"] != "data-generator-abc" {
 		t.Errorf("generator_id = %q", e.Metadata["generator_id"])
+	}
+}
+
+func TestLoadConfigTracingDefaults(t *testing.T) {
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+	t.Setenv("OTEL_SERVICE_NAME", "")
+
+	c := loadConfig()
+
+	if c.OTLPEndpoint != "" {
+		t.Errorf("OTLPEndpoint = %q, want empty so tracing stays off", c.OTLPEndpoint)
+	}
+	if c.ServiceName != "data-generator" {
+		t.Errorf("ServiceName = %q, want data-generator", c.ServiceName)
+	}
+}
+
+func TestLoadConfigReadsTracingEnvironment(t *testing.T) {
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://jaeger-collector:4318")
+	t.Setenv("OTEL_SERVICE_NAME", "custom-name")
+
+	c := loadConfig()
+
+	if c.OTLPEndpoint != "http://jaeger-collector:4318" {
+		t.Errorf("OTLPEndpoint = %q", c.OTLPEndpoint)
+	}
+	if c.ServiceName != "custom-name" {
+		t.Errorf("ServiceName = %q, want custom-name", c.ServiceName)
+	}
+}
+
+// Without a collector configured the service must still start, with spans
+// becoming no-ops rather than erroring or blocking on export.
+func TestInitTracingDisabledWithoutEndpoint(t *testing.T) {
+	cfg := testConfig("http://example.invalid/ingest")
+	cfg.OTLPEndpoint = ""
+
+	shutdown, err := initTracing(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("initTracing returned error when disabled: %v", err)
+	}
+	if shutdown == nil {
+		t.Fatal("shutdown func is nil")
+	}
+	if err := shutdown(context.Background()); err != nil {
+		t.Errorf("shutdown returned error: %v", err)
+	}
+}
+
+func TestFlushBufferWorksWithTracingDisabled(t *testing.T) {
+	got := make(chan int, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var events []DataEvent
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &events)
+		got <- len(events)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	g := NewGenerator(testConfig(srv.URL + "/ingest"))
+	g.addToBuffer(g.generateEvent())
+	g.addToBuffer(g.generateEvent())
+
+	g.flushBuffer()
+
+	select {
+	case n := <-got:
+		if n != 2 {
+			t.Errorf("received %d events, want 2", n)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("processor never received the batch")
 	}
 }

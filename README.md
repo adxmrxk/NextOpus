@@ -43,7 +43,7 @@ NextOpus tackles both problems at once:
 - **Kyverno** for cluster-wide policy enforcement
 - **Vault** for secret management
 - **NGINX Ingress** with rate limiting
-- **Prometheus** for metrics, **Jaeger** for tracing
+- **Prometheus** for metrics, **Jaeger** for tracing (both demo services are OpenTelemetry-instrumented)
 - **MetalLB** for LoadBalancer services on bare metal
 - **Guardian** autonomous self-healing controller
 - **Data Generator** (Go) and **Data Processor** (Python/FastAPI) demo apps
@@ -193,7 +193,7 @@ The interesting property of this design is that after Phase 3, **the cluster man
 | **NGINX Ingress** | Cluster ingress with annotation-driven rate limiting. |
 | **Vault**       | Secret management. |
 | **Prometheus**  | Metrics scraping and alerting. The source of truth for the Guardian. |
-| **Jaeger**      | Distributed tracing. |
+| **Jaeger**      | Distributed tracing. Both demo services export OTLP spans, and W3C trace context propagates across the generator to processor call so one batch appears as a single trace. |
 
 ### Workloads
 
@@ -417,6 +417,8 @@ The `.github/workflows/gitops-update.yaml` action closes the loop on image tags:
 | `BATCH_SIZE`            | Events per outbound batch                   | `50`    |
 | `FLUSH_INTERVAL_MS`     | Flush partial batches after this many ms    | `1000`  |
 | `PROCESSOR_ENDPOINT`    | Where to POST batches                       | `http://data-processor:8080/ingest` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP collector. Empty disables tracing | *(unset)* |
+| `OTEL_SERVICE_NAME`     | Name this service reports as                | `data-generator` |
 
 ### Data Processor
 
@@ -426,6 +428,34 @@ The `.github/workflows/gitops-update.yaml` action closes the loop on image tags:
 | `MAX_EVENTS`       | In-memory event cap                         | `100000`|
 | `RETENTION_HOURS`  | Drop events older than this many hours      | `24`    |
 | `LOG_LEVEL`        | DEBUG / INFO / WARN / ERROR                 | `INFO`  |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP collector. Empty disables tracing | *(unset)* |
+| `OTEL_SERVICE_NAME` | Name this service reports as               | `data-processor` |
+
+### Distributed Tracing
+
+Both demo services are instrumented with OpenTelemetry and export OTLP over
+HTTP. Tracing is off unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set, so local runs
+and the test suite need no collector.
+
+The generator opens a span per batch and the outbound POST carries a W3C
+`traceparent` header, which the processor's FastAPI instrumentation reads. One
+batch therefore appears in Jaeger as a single trace across both services:
+
+```
+data-generator   flush_batch
+  data-generator   HTTP POST
+    data-processor   POST /ingest
+      data-processor   count_events
+      data-processor   store_events
+```
+
+Health, readiness and metrics endpoints are excluded so probes and scrapes do
+not bury the interesting traces.
+
+```bash
+kubectl port-forward -n observability svc/jaeger-query 16686:16686
+# then open http://localhost:16686 and pick the data-generator service
+```
 
 ### Guardian
 
