@@ -15,6 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      packages: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -24,20 +25,29 @@ jobs:
         id: sha
         run: echo "sha=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
 
-      - name: Update data-generator image tag
-        run: |
-          sed -i "s|image: ghcr.io/.*/data-generator:.*|image: ghcr.io/${{ github.repository_owner }}/data-generator:${{ steps.sha.outputs.sha }}|g" \
-            kubernetes/apps/data-generator/deployment.yaml
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Update data-processor image tag
+      - name: Update image tags for services that were actually rebuilt
         run: |
-          sed -i "s|image: ghcr.io/.*/data-processor:.*|image: ghcr.io/${{ github.repository_owner }}/data-processor:${{ steps.sha.outputs.sha }}|g" \
-            kubernetes/apps/data-processor/deployment.yaml
-
-      - name: Update guardian image tag
-        run: |
-          sed -i "s|image: ghcr.io/.*/guardian:.*|image: ghcr.io/${{ github.repository_owner }}/guardian:${{ steps.sha.outputs.sha }}|g" \
-            kubernetes/apps/guardian/deployment.yaml
+          # CI only builds services whose paths changed, so rewriting every tag
+          # to this SHA points the untouched services at images that were never
+          # published. Only update a tag that exists in the registry.
+          SHA="${{ steps.sha.outputs.sha }}"
+          OWNER="${{ github.repository_owner }}"
+          for svc in data-generator data-processor guardian; do
+            image="ghcr.io/${OWNER}/${svc}:${SHA}"
+            if docker manifest inspect "$image" > /dev/null 2>&1; then
+              echo "updating ${svc} -> ${SHA}"
+              sed -i "s|image: ghcr.io/.*/${svc}:.*|image: ${image}|g" "kubernetes/apps/${svc}/deployment.yaml"
+            else
+              echo "skipping ${svc}: ${image} was not published for this commit"
+            fi
+          done
 
       - name: Commit and push
         run: |

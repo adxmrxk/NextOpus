@@ -38,7 +38,7 @@ spec:
         fsGroup: 1000
       containers:
         - name: data-processor
-          image: ghcr.io/adxmrxk/data-processor:5292703
+          image: ghcr.io/adxmrxk/data-processor:32cfd61
           imagePullPolicy: Always
           ports:
             - name: http
