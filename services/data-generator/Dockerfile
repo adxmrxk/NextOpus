@@ -16,11 +16,12 @@ RUN go mod download
 # Copy source
 COPY . .
 
-# Build binary
+# Build binary. Build the package, not a single file: naming main.go
+# explicitly breaks as soon as the package gains a second source file.
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
     -ldflags="-w -s" \
     -o /data-generator \
-    main.go
+    .
 
 # Runtime stage
 FROM --platform=$TARGETPLATFORM alpine:3.19
