@@ -7,6 +7,11 @@ metadata:
   name: istio-system
   labels:
     app.kubernetes.io/name: istio
+    # The gateway chart ships `image: auto` and relies on istiod's injection
+    # webhook to rewrite it to the real proxy image. Without this label nothing
+    # rewrites it and the gateway sits in ImagePullBackOff trying to pull
+    # docker.io/library/auto:latest.
+    istio-injection: enabled
 ---
 apiVersion: helm.cattle.io/v1
 kind: HelmChart
