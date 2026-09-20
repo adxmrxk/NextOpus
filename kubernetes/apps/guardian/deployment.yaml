@@ -78,7 +78,7 @@ spec:
         fsGroup: 1000
       containers:
         - name: guardian
-          image: ghcr.io/adxmrxk/guardian:66e2ddd
+          image: ghcr.io/adxmrxk/guardian:2e15bf4
           imagePullPolicy: Always
           ports:
             - name: http
