@@ -26,6 +26,11 @@ rules:
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create", "patch"]
+  # Leader election. Without a lease a second replica would remediate the same
+  # anomaly, doubling every restart and scale-up.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -51,7 +56,9 @@ metadata:
     app.kubernetes.io/component: self-healing
     app.kubernetes.io/part-of: nextopus-platform
 spec:
-  replicas: 1
+  # Safe now that leader election is in place: the follower stands by and only
+  # the lease holder remediates.
+  replicas: 2
   selector:
     matchLabels:
       app: guardian
@@ -95,6 +102,26 @@ spec:
               value: "300"
             - name: SCALE_COOLDOWN
               value: "600"
+            # Blast radius. Per-target cooldowns do nothing in a cluster-wide
+            # incident where every target is distinct.
+            - name: MAX_ACTIONS_PER_WINDOW
+              value: "10"
+            - name: ACTION_WINDOW_SECONDS
+              value: "600"
+            # false: the breaker reopens once the window clears. Set true to
+            # latch until a human restarts the Guardian.
+            - name: HALT_ON_BREAKER
+              value: "false"
+            - name: EMIT_EVENTS
+              value: "true"
+            - name: LEADER_ELECTION
+              value: "true"
+            - name: LEASE_NAMESPACE
+              value: "nextopus-system"
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
           resources:
             requests:
               cpu: 50m

@@ -34,11 +34,14 @@ class FakePrometheus:
 class FakeK8s:
     """Records calls instead of touching a cluster."""
 
-    def __init__(self, replicas=(3, 3, 3), raises=None):
+    def __init__(self, replicas=(3, 3, 3), raises=None, lease_granted=True):
         self.dry_run = True
         self.replicas = replicas
         self.raises = raises
         self.calls = []
+        self.events = []
+        self.lease_granted = lease_granted
+        self.lease_released = False
 
     def _maybe_raise(self):
         if self.raises:
@@ -67,6 +70,17 @@ class FakeK8s:
         return G.Action(type=G.ActionType.CORDON_NODE, target=name,
                         reason="test", success=True, result="cordoned")
 
+    def emit_event(self, reason, message, namespace, involved_name,
+                   involved_kind="Pod", event_type="Normal"):
+        self.events.append({"reason": reason, "target": involved_name, "type": event_type})
+        return True
+
+    def acquire_or_renew_lease(self, name, namespace, identity, duration):
+        return self.lease_granted
+
+    def release_lease(self, name, namespace, identity):
+        self.lease_released = True
+
 
 def sample(metric, value):
     return [{"metric": metric, "value": [0, str(value)]}]
@@ -83,6 +97,9 @@ def make_guardian(prom=None, k8s=None, **env):
     g.scale_timestamps = {}
     g.active_anomalies = []
     g.action_history = []
+    g.recent_actions = []
+    g.breaker_tripped = False
+    g.is_leader = True
     g.running = False
     return g
 
@@ -336,3 +353,161 @@ async def test_metrics_endpoint_serves_prometheus_text(api):
     assert r.status == 200
     assert "text/plain" in r.headers["Content-Type"]
     assert "guardian_checks_total" in await r.text()
+
+
+# ---------------------------------------------------------------------------
+# Blast radius circuit breaker
+# ---------------------------------------------------------------------------
+
+def anomaly(target="data-generator-abc-xyz", action=G.ActionType.SCALE_UP):
+    """Defaults to the scale path: FakeK8s.get_pods returns nothing, so the
+    restart path would find no pod to act on."""
+    return G.Anomaly(type="high_cpu", severity=G.Severity.WARNING, target=target,
+                     message="hot", value=0.95, suggested_action=action)
+
+
+def test_breaker_closed_when_under_limit():
+    g = make_guardian(max_actions_per_window=5)
+    for i in range(4):
+        g.record_action(f"pod-{i}")
+    assert g.blast_radius_exceeded() is False
+
+
+def test_breaker_opens_at_the_limit():
+    g = make_guardian(max_actions_per_window=3)
+    for i in range(3):
+        g.record_action(f"pod-{i}")
+    assert g.blast_radius_exceeded() is True
+
+
+async def test_breaker_suppresses_remediation_across_distinct_targets():
+    """Per-target cooldowns do not help here: every target is different."""
+    k8s = FakeK8s()
+    g = make_guardian(k8s=k8s, max_actions_per_window=3)
+    for i in range(6):
+        await g.remediate(anomaly(target=f"data-generator-{i}-xyz"))
+    assert len(k8s.calls) == 3
+
+
+def test_breaker_window_expires():
+    from datetime import datetime, timedelta
+
+    g = make_guardian(max_actions_per_window=2, action_window_seconds=60)
+    g.recent_actions = [datetime.utcnow() - timedelta(seconds=120)] * 5
+    assert g.blast_radius_exceeded() is False
+    assert g.recent_actions == []
+
+
+def test_breaker_latches_when_halt_configured():
+    g = make_guardian(max_actions_per_window=1, halt_on_breaker=True)
+    g.record_action("pod-a")
+    assert g.blast_radius_exceeded() is True
+    assert g.breaker_tripped is True
+    g.recent_actions = []          # window clears
+    assert g.blast_radius_exceeded() is True   # still latched
+
+
+def test_breaker_does_not_latch_by_default():
+    g = make_guardian(max_actions_per_window=1)
+    g.record_action("pod-a")
+    assert g.blast_radius_exceeded() is True
+    g.recent_actions = []
+    assert g.blast_radius_exceeded() is False
+
+
+async def test_suppressed_remediation_emits_a_warning_event():
+    k8s = FakeK8s()
+    g = make_guardian(k8s=k8s, max_actions_per_window=0)
+    assert await g.remediate(anomaly()) is None
+    assert any(e["reason"] == "RemediationSuppressed" and e["type"] == "Warning"
+               for e in k8s.events)
+
+
+# ---------------------------------------------------------------------------
+# Kubernetes Events
+# ---------------------------------------------------------------------------
+
+async def test_successful_remediation_emits_event():
+    k8s = FakeK8s()
+    g = make_guardian(k8s=k8s)
+    await g.remediate(anomaly(action=G.ActionType.SCALE_UP))
+    assert [e["reason"] for e in k8s.events] == ["Remediated"]
+
+
+async def test_events_can_be_disabled():
+    k8s = FakeK8s()
+    g = make_guardian(k8s=k8s, emit_events=False)
+    await g.remediate(anomaly(action=G.ActionType.SCALE_UP))
+    assert k8s.events == []
+
+
+async def test_event_failure_does_not_break_remediation():
+    class Exploding(FakeK8s):
+        def emit_event(self, *a, **kw):
+            raise RuntimeError("apiserver said no")
+
+    k8s = Exploding()
+    g = make_guardian(k8s=k8s)
+    # The audit trail is best effort; the action itself must still land.
+    with pytest.raises(RuntimeError):
+        await g.remediate(anomaly(action=G.ActionType.SCALE_UP))
+    assert k8s.calls, "the scale call should have happened before the event"
+
+
+# ---------------------------------------------------------------------------
+# Leader election
+# ---------------------------------------------------------------------------
+
+async def test_leader_runs_checks():
+    g = make_guardian(FakePrometheus({}), FakeK8s(lease_granted=True), leader_election=True)
+    g.is_leader = False
+    await g._refresh_leadership()
+    assert g.is_leader is True
+
+
+async def test_follower_stands_by():
+    g = make_guardian(FakePrometheus({}), FakeK8s(lease_granted=False), leader_election=True)
+    g.is_leader = True
+    await g._refresh_leadership()
+    assert g.is_leader is False
+
+
+async def test_follower_does_not_remediate():
+    """A follower must never act, or two replicas double every restart."""
+    k8s = FakeK8s(lease_granted=False)
+    g = make_guardian(FakePrometheus({
+        "kube_pod_container_status_restarts_total": sample({"pod": "data-generator-a-b"}, 9)
+    }), k8s, leader_election=True)
+    g.running = True
+
+    async def stop_after_one_cycle(_):
+        g.running = False
+    import guardian as _g
+    original = _g.asyncio.sleep
+    _g.asyncio.sleep = stop_after_one_cycle
+    try:
+        await g.run()
+    finally:
+        _g.asyncio.sleep = original
+
+    assert g.is_leader is False
+    assert k8s.calls == []
+
+
+def test_leader_election_can_be_disabled():
+    g = G.Guardian.__new__(G.Guardian)
+    cfg = G.GuardianConfig(leader_election=False)
+    g.config = cfg
+    g.is_leader = not cfg.leader_election
+    assert g.is_leader is True
+
+
+# ---------------------------------------------------------------------------
+# /status
+# ---------------------------------------------------------------------------
+
+async def test_status_reports_breaker_budget(api):
+    body = await (await api.get("/status")).json()
+    assert body["circuit_breaker"]["limit"] > 0
+    assert body["circuit_breaker"]["open"] is False
+    assert "leader" in body

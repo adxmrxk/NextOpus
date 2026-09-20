@@ -18,7 +18,7 @@ import logging
 import os
 import signal
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
@@ -55,6 +55,26 @@ class GuardianConfig:
     # Cooldown periods (seconds)
     action_cooldown: int = int(os.getenv("ACTION_COOLDOWN", "300"))
     scale_cooldown: int = int(os.getenv("SCALE_COOLDOWN", "600"))
+
+    # Blast radius. Per-target cooldowns do not help during a cluster-wide
+    # incident, where every target is distinct and the Guardian would happily
+    # restart everything at once. This caps total actions across all targets.
+    max_actions_per_window: int = int(os.getenv("MAX_ACTIONS_PER_WINDOW", "10"))
+    action_window_seconds: int = int(os.getenv("ACTION_WINDOW_SECONDS", "600"))
+    # Trips the breaker permanently until a human restarts the Guardian.
+    halt_on_breaker: bool = os.getenv("HALT_ON_BREAKER", "false").lower() == "true"
+
+    # Kubernetes Events give operators an audit trail in `kubectl describe`
+    # rather than only a log line inside a pod that may get deleted.
+    emit_events: bool = os.getenv("EMIT_EVENTS", "true").lower() == "true"
+
+    # Leader election. More than one replica remediating the same anomaly
+    # means double restarts and double scale-ups.
+    leader_election: bool = os.getenv("LEADER_ELECTION", "true").lower() == "true"
+    lease_name: str = os.getenv("LEASE_NAME", "guardian-leader")
+    lease_namespace: str = os.getenv("LEASE_NAMESPACE", "nextopus-system")
+    lease_duration: int = int(os.getenv("LEASE_DURATION", "30"))
+    identity: str = os.getenv("HOSTNAME", "guardian-local")
 
 
 # ==============================================================================
@@ -93,6 +113,28 @@ CHECK_DURATION = Histogram(
     'guardian_check_duration_seconds',
     'Duration of health check cycles',
     buckets=[0.1, 0.5, 1.0, 2.5, 5.0, 10.0]
+)
+
+ACTIONS_SUPPRESSED = Counter(
+    'guardian_actions_suppressed_total',
+    'Remediations not taken, by reason',
+    ['reason']
+)
+
+BREAKER_OPEN = Gauge(
+    'guardian_circuit_breaker_open',
+    'Blast-radius breaker state (1 = open, actions suppressed)'
+)
+
+IS_LEADER = Gauge(
+    'guardian_is_leader',
+    'Whether this replica currently holds the leader lease'
+)
+
+EVENTS_EMITTED = Counter(
+    'guardian_events_emitted_total',
+    'Kubernetes Events written for remediation decisions',
+    ['reason']
 )
 
 
@@ -203,6 +245,7 @@ class KubernetesController:
 
         self.core_v1 = client.CoreV1Api()
         self.apps_v1 = client.AppsV1Api()
+        self.coordination_v1 = client.CoordinationV1Api()
 
     def restart_pod(self, name: str, namespace: str) -> Action:
         """Delete a pod to trigger restart."""
@@ -318,6 +361,131 @@ class KubernetesController:
 
         return action
 
+    def emit_event(
+        self,
+        reason: str,
+        message: str,
+        namespace: str,
+        involved_name: str,
+        involved_kind: str = "Pod",
+        event_type: str = "Normal",
+    ) -> bool:
+        """Write a Kubernetes Event so the decision shows up in kubectl.
+
+        The ClusterRole already grants events create/patch. Without this the
+        only record of a remediation is a log line inside a pod that may be
+        deleted moments later.
+        """
+        now = datetime.now(timezone.utc)
+        body = client.CoreV1Event(
+            metadata=client.V1ObjectMeta(
+                generate_name=f"guardian-{reason.lower()}-",
+                namespace=namespace,
+            ),
+            involved_object=client.V1ObjectReference(
+                kind=involved_kind,
+                name=involved_name,
+                namespace=namespace,
+            ),
+            reason=reason,
+            message=message,
+            type=event_type,
+            source=client.V1EventSource(component="nextopus-guardian"),
+            first_timestamp=now,
+            last_timestamp=now,
+            count=1,
+        )
+        try:
+            self.core_v1.create_namespaced_event(namespace=namespace, body=body)
+            EVENTS_EMITTED.labels(reason=reason).inc()
+            return True
+        except Exception as e:
+            # An audit trail failing must never stop the remediation itself.
+            logger.warning(f"Could not emit event {reason} for {namespace}/{involved_name}: {e}")
+            return False
+
+    # -- Leader election ------------------------------------------------------
+
+    def acquire_or_renew_lease(self, name: str, namespace: str, identity: str,
+                               duration: int) -> bool:
+        """Try to hold the leader Lease. Returns True if this replica leads.
+
+        Standard Kubernetes lease semantics: take it if it does not exist, renew
+        it if we already hold it, steal it only once it has visibly expired.
+        """
+        now = datetime.now(timezone.utc)
+        try:
+            lease = self.coordination_v1.read_namespaced_lease(name, namespace)
+        except Exception as e:
+            if getattr(e, "status", None) != 404:
+                logger.error(f"Lease read failed: {e}")
+                return False
+            lease = None
+
+        if lease is None:
+            body = client.V1Lease(
+                metadata=client.V1ObjectMeta(name=name, namespace=namespace),
+                spec=client.V1LeaseSpec(
+                    holder_identity=identity,
+                    lease_duration_seconds=duration,
+                    acquire_time=now,
+                    renew_time=now,
+                ),
+            )
+            try:
+                self.coordination_v1.create_namespaced_lease(namespace, body)
+                logger.info(f"Acquired leader lease {namespace}/{name} as {identity}")
+                return True
+            except Exception as e:
+                logger.info(f"Lost the race to create the lease: {e}")
+                return False
+
+        spec = lease.spec
+        holder = spec.holder_identity
+        renewed = spec.renew_time
+        ttl = spec.lease_duration_seconds or duration
+
+        if holder == identity:
+            spec.renew_time = now
+            try:
+                self.coordination_v1.replace_namespaced_lease(name, namespace, lease)
+                return True
+            except Exception as e:
+                logger.warning(f"Lease renewal failed: {e}")
+                return False
+
+        # Someone else holds it. Only take over once it has actually expired.
+        if renewed is not None:
+            age = (now - renewed).total_seconds()
+            if age < ttl:
+                return False
+            logger.info(f"Lease held by {holder} expired {age:.0f}s ago, taking over")
+
+        spec.holder_identity = identity
+        spec.acquire_time = now
+        spec.renew_time = now
+        spec.lease_duration_seconds = duration
+        try:
+            self.coordination_v1.replace_namespaced_lease(name, namespace, lease)
+            logger.info(f"Took over leader lease {namespace}/{name} as {identity}")
+            return True
+        except Exception as e:
+            logger.info(f"Lease takeover failed, another replica won: {e}")
+            return False
+
+    def release_lease(self, name: str, namespace: str, identity: str) -> None:
+        """Give up leadership on shutdown so a peer takes over immediately."""
+        try:
+            lease = self.coordination_v1.read_namespaced_lease(name, namespace)
+            if lease.spec.holder_identity != identity:
+                return
+            lease.spec.holder_identity = ""
+            lease.spec.renew_time = None
+            self.coordination_v1.replace_namespaced_lease(name, namespace, lease)
+            logger.info("Released leader lease")
+        except Exception as e:
+            logger.debug(f"Lease release skipped: {e}")
+
     def get_pods(self, namespace: str, label_selector: str = "") -> List:
         """Get pods in namespace."""
         try:
@@ -351,6 +519,12 @@ class Guardian:
         self.active_anomalies: List[Anomaly] = []
         self.action_history: List[Action] = []
 
+        # Timestamps of recent actions across every target, for blast radius.
+        self.recent_actions: List[datetime] = []
+        self.breaker_tripped = False
+
+        self.is_leader = not config.leader_election
+
         self.running = False
 
     def can_take_action(self, target: str, is_scale: bool = False) -> bool:
@@ -370,6 +544,39 @@ class Guardian:
         """Record that an action was taken (for cooldown tracking)."""
         timestamps = self.scale_timestamps if is_scale else self.action_timestamps
         timestamps[target] = datetime.utcnow()
+        self.recent_actions.append(datetime.utcnow())
+
+    def _prune_action_window(self) -> int:
+        """Drop actions older than the window and return what is left."""
+        cutoff = datetime.utcnow() - timedelta(seconds=self.config.action_window_seconds)
+        self.recent_actions = [t for t in self.recent_actions if t >= cutoff]
+        return len(self.recent_actions)
+
+    def blast_radius_exceeded(self) -> bool:
+        """Cap total actions across all targets, not just per target.
+
+        Per-target cooldowns do nothing during a cluster-wide incident, where
+        every target is different. Without this the Guardian would restart
+        everything at once and turn a partial outage into a full one.
+        """
+        if self.breaker_tripped:
+            return True
+
+        count = self._prune_action_window()
+        if count < self.config.max_actions_per_window:
+            BREAKER_OPEN.set(0)
+            return False
+
+        logger.error(
+            f"Blast radius exceeded: {count} actions in the last "
+            f"{self.config.action_window_seconds}s (limit {self.config.max_actions_per_window}). "
+            f"Suppressing further remediation."
+        )
+        BREAKER_OPEN.set(1)
+        if self.config.halt_on_breaker:
+            self.breaker_tripped = True
+            logger.error("HALT_ON_BREAKER set: staying latched until restart")
+        return True
 
     async def check_crash_loops(self) -> List[Anomaly]:
         """Check for pods in CrashLoopBackOff."""
@@ -525,8 +732,18 @@ class Guardian:
         target = anomaly.target
         is_scale = anomaly.suggested_action in [ActionType.SCALE_UP, ActionType.SCALE_DOWN]
 
+        if self.blast_radius_exceeded():
+            ACTIONS_SUPPRESSED.labels(reason="blast_radius").inc()
+            self._emit(
+                "RemediationSuppressed",
+                f"Blast radius limit reached; not acting on {anomaly.type} for {target}",
+                target, event_type="Warning",
+            )
+            return None
+
         if not self.can_take_action(target, is_scale):
             logger.info(f"Skipping action on {target} - in cooldown")
+            ACTIONS_SUPPRESSED.labels(reason="cooldown").inc()
             return None
 
         action = None
@@ -569,8 +786,36 @@ class Guardian:
             self.action_history.append(action)
             # Keep only last 100 actions
             self.action_history = self.action_history[-100:]
+            self._emit(
+                "Remediated",
+                f"{action.type.value} on {action.target}: {action.result} "
+                f"(triggered by {anomaly.type}: {anomaly.message})",
+                target,
+            )
+        elif action:
+            ACTIONS_SUPPRESSED.labels(reason="action_failed").inc()
+            self._emit(
+                "RemediationFailed",
+                f"{action.type.value} on {action.target} failed: {action.result}",
+                target, event_type="Warning",
+            )
 
         return action
+
+    def _emit(self, reason: str, message: str, target: str,
+              event_type: str = "Normal") -> None:
+        """Write a Kubernetes Event, if enabled. Never raises."""
+        if not self.config.emit_events:
+            return
+        # Node-scoped actions have no namespace; attribute them to the pod
+        # namespace we watch so they stay discoverable.
+        self.k8s.emit_event(
+            reason=reason,
+            message=message,
+            namespace=self.config.namespace,
+            involved_name=target,
+            event_type=event_type,
+        )
 
     async def run_check_cycle(self):
         """Run a full health check cycle."""
@@ -641,7 +886,13 @@ class Guardian:
 
         while self.running:
             try:
-                await self.run_check_cycle()
+                if self.config.leader_election:
+                    await self._refresh_leadership()
+
+                if self.is_leader:
+                    await self.run_check_cycle()
+                else:
+                    logger.debug("Not leader, standing by")
             except Exception as e:
                 logger.exception(f"Check cycle failed: {e}")
                 HEALTH_STATUS.set(0)
@@ -649,7 +900,26 @@ class Guardian:
             await asyncio.sleep(self.config.check_interval)
 
         HEALTH_STATUS.set(0)
+        if self.config.leader_election and self.is_leader:
+            await asyncio.to_thread(
+                self.k8s.release_lease,
+                self.config.lease_name, self.config.lease_namespace, self.config.identity,
+            )
         await self.prometheus.close()
+
+    async def _refresh_leadership(self) -> None:
+        """Take or renew the lease. Only the leader remediates."""
+        was_leader = self.is_leader
+        self.is_leader = await asyncio.to_thread(
+            self.k8s.acquire_or_renew_lease,
+            self.config.lease_name,
+            self.config.lease_namespace,
+            self.config.identity,
+            self.config.lease_duration,
+        )
+        IS_LEADER.set(1 if self.is_leader else 0)
+        if self.is_leader != was_leader:
+            logger.info("Became leader" if self.is_leader else "Lost leadership, standing by")
 
     def stop(self):
         """Stop the guardian."""
@@ -669,7 +939,30 @@ async def create_app(guardian: Guardian) -> web.Application:
         return web.json_response({
             "status": "healthy",
             "running": guardian.running,
-            "namespace": guardian.config.namespace
+            "namespace": guardian.config.namespace,
+            "leader": guardian.is_leader,
+            "identity": guardian.config.identity,
+        })
+
+    async def status(request):
+        """Operational state: leadership and remaining blast-radius budget."""
+        used = guardian._prune_action_window()
+        limit = guardian.config.max_actions_per_window
+        return web.json_response({
+            "leader": guardian.is_leader,
+            "identity": guardian.config.identity,
+            "leader_election": guardian.config.leader_election,
+            "dry_run": guardian.config.dry_run,
+            "circuit_breaker": {
+                "open": guardian.breaker_tripped or used >= limit,
+                "latched": guardian.breaker_tripped,
+                "actions_in_window": used,
+                "limit": limit,
+                "window_seconds": guardian.config.action_window_seconds,
+                "remaining": max(0, limit - used),
+            },
+            "active_anomalies": len(guardian.active_anomalies),
+            "actions_recorded": len(guardian.action_history),
         })
 
     async def metrics(request):
@@ -711,6 +1004,7 @@ async def create_app(guardian: Guardian) -> web.Application:
         })
 
     app.router.add_get("/health", health)
+    app.router.add_get("/status", status)
     app.router.add_get("/metrics", metrics)
     app.router.add_get("/anomalies", anomalies)
     app.router.add_get("/actions", actions)
