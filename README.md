@@ -81,9 +81,38 @@ curl localhost:8080/health         # Liveness + namespace info
 curl localhost:8080/anomalies      # Currently active anomalies
 curl localhost:8080/actions        # Last 20 actions taken
 curl localhost:8080/metrics        # Prometheus metrics
+curl localhost:8080/status         # Leadership and remaining action budget
 ```
 
 ---
+
+## Verifying Self-Healing
+
+The claim that the platform recovers without a human is checked by a job, not
+asserted. It deletes a real pod, then watches the Kubernetes API from the
+outside until the deployment is back to its desired replica count, failing if
+that does not happen inside the deadline. It deliberately ignores anything the
+Guardian reports about itself, because a broken Guardian still writes logs.
+
+```bash
+kubectl apply -f kubernetes/chaos/
+kubectl -n nextopus wait --for=condition=complete job/chaos-self-healing-test --timeout=180s
+kubectl -n nextopus logs job/chaos-self-healing-test
+```
+
+It lives outside every ArgoCD Application path on purpose: the guardian app
+syncs with `selfHeal`, so a Job stored there would kill a pod on every sync.
+
+## Service Level Objectives
+
+`kubernetes/observability/slo.yaml` turns the "removes operator toil" claim
+into measured numbers: recording rules for ingest availability and latency,
+plus how often the Guardian acts and what share of its actions succeed.
+
+Alerts fire on error-budget burn rate rather than instantaneous badness, using
+the standard multi-window approach, so a one-minute blip stays quiet while a
+sustained problem pages. It also covers the failure mode nobody notices: the
+healer itself being broken, thrashing, leaderless, or wedged.
 
 ## How It Works
 

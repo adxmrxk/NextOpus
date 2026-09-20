@@ -1,0 +1,205 @@
+---
+# Service level objectives.
+#
+# The platform's pitch is that it removes operator toil. Nothing measured that:
+# the existing rules alert on raw conditions ("error rate above 0.1/s"), which
+# says nothing about whether the service is meeting a commitment or how much
+# room is left before it stops.
+#
+# These rules define availability as an SLI, then alert on how fast the error
+# budget is burning rather than on instantaneous badness. Multi-window,
+# multi-burn-rate is the standard approach: a fast burn pages, a slow burn is a
+# ticket, and both need a short window to agree so a one-minute blip does not
+# fire.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: nextopus-slo
+  namespace: observability
+  labels:
+    app: nextopus
+    prometheus: kube-prometheus
+    role: slo-rules
+spec:
+  groups:
+    # ------------------------------------------------------------------
+    # Recording rules. Computed once here so the alerts below stay cheap
+    # and every dashboard reads the same numbers.
+    # ------------------------------------------------------------------
+    - name: nextopus.sli
+      interval: 30s
+      rules:
+        # Availability SLI: the share of ingest attempts that were not errors.
+        # Rate windows are pre-computed per burn-rate window.
+        - record: nextopus:ingest_error_ratio:rate5m
+          expr: |
+            sum(rate(nextopus_processor_errors_total[5m]))
+            /
+            clamp_min(sum(rate(nextopus_processor_events_processed_total[5m])), 1)
+
+        - record: nextopus:ingest_error_ratio:rate30m
+          expr: |
+            sum(rate(nextopus_processor_errors_total[30m]))
+            /
+            clamp_min(sum(rate(nextopus_processor_events_processed_total[30m])), 1)
+
+        - record: nextopus:ingest_error_ratio:rate1h
+          expr: |
+            sum(rate(nextopus_processor_errors_total[1h]))
+            /
+            clamp_min(sum(rate(nextopus_processor_events_processed_total[1h])), 1)
+
+        - record: nextopus:ingest_error_ratio:rate6h
+          expr: |
+            sum(rate(nextopus_processor_errors_total[6h]))
+            /
+            clamp_min(sum(rate(nextopus_processor_events_processed_total[6h])), 1)
+
+        # Latency SLI: share of ingest requests served inside 250ms.
+        - record: nextopus:ingest_latency_good_ratio:rate30m
+          expr: |
+            sum(rate(nextopus_processor_latency_seconds_bucket{le="0.25"}[30m]))
+            /
+            clamp_min(sum(rate(nextopus_processor_latency_seconds_count[30m])), 1)
+
+        # Toil: how much the Guardian is actually absorbing. This is the number
+        # that justifies the platform existing.
+        - record: nextopus:guardian_actions:rate1h
+          expr: sum(rate(guardian_actions_taken_total[1h]))
+
+        - record: nextopus:guardian_failed_actions:rate1h
+          expr: sum(rate(guardian_actions_failed_total[1h]))
+
+        # Share of remediations that worked. A Guardian that acts constantly and
+        # fixes nothing is worse than one that does nothing.
+        - record: nextopus:guardian_success_ratio:rate6h
+          expr: |
+            1 - (
+              sum(rate(guardian_actions_failed_total[6h]))
+              /
+              clamp_min(sum(rate(guardian_actions_taken_total[6h])), 1)
+            )
+
+    # ------------------------------------------------------------------
+    # Error budget burn. Target is 99.9% availability over 30 days, so the
+    # budget is 0.1%. Burn rate 14.4 exhausts it in ~2 days, 6 in ~5 days.
+    # ------------------------------------------------------------------
+    - name: nextopus.slo.burn
+      interval: 30s
+      rules:
+        - alert: NextOpusErrorBudgetBurnFast
+          expr: |
+            nextopus:ingest_error_ratio:rate5m > (14.4 * 0.001)
+            and
+            nextopus:ingest_error_ratio:rate1h > (14.4 * 0.001)
+          for: 2m
+          labels:
+            severity: critical
+            service: data-processor
+            slo: ingest-availability
+          annotations:
+            summary: "Burning the ingest error budget fast"
+            description: >-
+              Errors are consuming the 30 day budget about 14x faster than
+              sustainable. At this rate it is gone in roughly two days.
+              Current 5m ratio {{ $value | printf "%.4f" }}.
+
+        - alert: NextOpusErrorBudgetBurnSlow
+          expr: |
+            nextopus:ingest_error_ratio:rate30m > (6 * 0.001)
+            and
+            nextopus:ingest_error_ratio:rate6h > (6 * 0.001)
+          for: 15m
+          labels:
+            severity: warning
+            service: data-processor
+            slo: ingest-availability
+          annotations:
+            summary: "Burning the ingest error budget steadily"
+            description: >-
+              Errors are consuming the budget about 6x faster than sustainable.
+              Not urgent, but it will not hold for the month.
+              Current 30m ratio {{ $value | printf "%.4f" }}.
+
+        - alert: NextOpusLatencySLOBreached
+          expr: nextopus:ingest_latency_good_ratio:rate30m < 0.95
+          for: 10m
+          labels:
+            severity: warning
+            service: data-processor
+            slo: ingest-latency
+          annotations:
+            summary: "Ingest latency objective missed"
+            description: >-
+              Only {{ $value | humanizePercentage }} of ingests completed inside
+              250ms over the last 30 minutes; the objective is 95%.
+
+    # ------------------------------------------------------------------
+    # Guardian health. A self healing platform whose healer is broken or
+    # thrashing is the failure mode nobody notices.
+    # ------------------------------------------------------------------
+    - name: nextopus.guardian.slo
+      interval: 30s
+      rules:
+        - alert: GuardianRemediationsFailing
+          expr: nextopus:guardian_success_ratio:rate6h < 0.8
+          for: 15m
+          labels:
+            severity: critical
+            service: guardian
+          annotations:
+            summary: "Guardian remediations are mostly failing"
+            description: >-
+              Only {{ $value | humanizePercentage }} of remediation attempts
+              succeeded over 6 hours. The Guardian is acting but not fixing,
+              which usually means RBAC or a wrong target.
+
+        - alert: GuardianCircuitBreakerOpen
+          expr: guardian_circuit_breaker_open > 0
+          for: 5m
+          labels:
+            severity: critical
+            service: guardian
+          annotations:
+            summary: "Guardian blast radius breaker is open"
+            description: >-
+              The Guardian hit its action cap and has stopped remediating.
+              Something is failing faster than it can be repaired, and nothing
+              is being fixed automatically right now.
+
+        - alert: GuardianThrashing
+          expr: nextopus:guardian_actions:rate1h > 0.05
+          for: 30m
+          labels:
+            severity: warning
+            service: guardian
+          annotations:
+            summary: "Guardian is remediating unusually often"
+            description: >-
+              More than three actions an hour, sustained for 30 minutes. The
+              Guardian is papering over a problem rather than anything being
+              genuinely fixed.
+
+        - alert: GuardianNoLeader
+          expr: max(guardian_is_leader) < 1
+          for: 5m
+          labels:
+            severity: critical
+            service: guardian
+          annotations:
+            summary: "No Guardian replica holds the leader lease"
+            description: >-
+              Every replica is standing by, so nothing is remediating. Usually a
+              lease RBAC problem or an expired lease nobody could take over.
+
+        - alert: GuardianNotChecking
+          expr: rate(guardian_checks_total[15m]) == 0
+          for: 10m
+          labels:
+            severity: critical
+            service: guardian
+          annotations:
+            summary: "Guardian has stopped running check cycles"
+            description: >-
+              No check cycles in 15 minutes. The pod may be up and serving
+              health checks while the control loop is wedged.

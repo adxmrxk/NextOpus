@@ -1,0 +1,143 @@
+---
+# Self-healing verification.
+#
+# The platform's headline claim is that it recovers from failure without a
+# human. Nothing proved that: the Guardian's own logs are not evidence, because
+# a broken Guardian writes logs too.
+#
+# This job injects a real failure and then asserts recovery from the outside,
+# using the Kubernetes API rather than anything the Guardian reports about
+# itself. It fails loudly if recovery does not happen inside the deadline.
+#
+# Deliberately outside every ArgoCD Application path. The guardian app syncs
+# with selfHeal, so a Job living there would delete a pod on every sync. Run it
+# when you mean to:
+#
+#   kubectl apply -f kubernetes/chaos/
+#   kubectl -n nextopus wait --for=condition=complete job/chaos-self-healing-test --timeout=180s
+#   kubectl -n nextopus logs job/chaos-self-healing-test
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: chaos-verifier
+  namespace: nextopus
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: chaos-verifier
+  namespace: nextopus
+rules:
+  # Delete is how the failure is injected; the rest is how recovery is observed.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: chaos-verifier
+  namespace: nextopus
+subjects:
+  - kind: ServiceAccount
+    name: chaos-verifier
+    namespace: nextopus
+roleRef:
+  kind: Role
+  name: chaos-verifier
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: chaos-self-healing-test
+  namespace: nextopus
+spec:
+  ttlSecondsAfterFinished: 3600
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: chaos-self-healing-test
+    spec:
+      serviceAccountName: chaos-verifier
+      restartPolicy: Never
+      # add-default-securitycontext injects runAsNonRoot, and the kubectl image
+      # runs as root by default.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: chaos
+          image: rancher/kubectl:v1.31.2
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -u
+              NS=nextopus
+              TARGET=${TARGET_DEPLOYMENT:-data-processor}
+              DEADLINE=${RECOVERY_DEADLINE_SECONDS:-120}
+
+              fail() { echo "FAIL: $1"; exit 1; }
+
+              echo "=== NextOpus self-healing verification ==="
+              echo "target: deployment/$TARGET in $NS"
+              echo "recovery deadline: ${DEADLINE}s"
+              echo ""
+
+              WANT=$(kubectl -n "$NS" get deploy "$TARGET" -o jsonpath='{.spec.replicas}')
+              [ -n "$WANT" ] || fail "deployment $TARGET not found"
+              echo "desired replicas: $WANT"
+
+              READY=$(kubectl -n "$NS" get deploy "$TARGET" -o jsonpath='{.status.readyReplicas}')
+              READY=${READY:-0}
+              [ "$READY" = "$WANT" ] || fail "not healthy before the test: $READY/$WANT ready"
+              echo "healthy before injection: $READY/$WANT"
+              echo ""
+
+              VICTIM=$(kubectl -n "$NS" get pods -l app="$TARGET" \
+                        -o jsonpath='{.items[0].metadata.name}')
+              [ -n "$VICTIM" ] || fail "no pods found for $TARGET"
+
+              echo "=== injecting failure ==="
+              echo "deleting pod $VICTIM"
+              kubectl -n "$NS" delete pod "$VICTIM" --wait=false || fail "could not delete $VICTIM"
+              echo ""
+
+              echo "=== waiting for recovery ==="
+              ELAPSED=0
+              while [ "$ELAPSED" -lt "$DEADLINE" ]; do
+                READY=$(kubectl -n "$NS" get deploy "$TARGET" -o jsonpath='{.status.readyReplicas}')
+                READY=${READY:-0}
+                # The victim must be gone and the count back to desired, so a
+                # stale terminating pod cannot make this look green.
+                STILL=$(kubectl -n "$NS" get pod "$VICTIM" --ignore-not-found \
+                          -o jsonpath='{.metadata.name}' 2>/dev/null || true)
+                echo "  t=${ELAPSED}s ready=${READY}/${WANT} victim_present=${STILL:-no}"
+                if [ "$READY" = "$WANT" ] && [ -z "$STILL" ]; then
+                  echo ""
+                  echo "PASS: recovered to ${READY}/${WANT} in ${ELAPSED}s without intervention"
+                  exit 0
+                fi
+                sleep 5
+                ELAPSED=$((ELAPSED + 5))
+              done
+
+              echo ""
+              kubectl -n "$NS" get pods -l app="$TARGET"
+              fail "did not return to ${WANT} ready replicas within ${DEADLINE}s"
+          env:
+            - name: TARGET_DEPLOYMENT
+              value: "data-processor"
+            - name: RECOVERY_DEADLINE_SECONDS
+              value: "120"
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
