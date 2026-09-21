@@ -56,6 +56,16 @@ class GuardianConfig:
     action_cooldown: int = int(os.getenv("ACTION_COOLDOWN", "300"))
     scale_cooldown: int = int(os.getenv("SCALE_COOLDOWN", "600"))
 
+    # Predictive remediation. Thresholds only fire once a pod is already in
+    # trouble; predict_linear extrapolates the current trend so the Guardian can
+    # act before the OOM kill rather than restarting after it.
+    predictive: bool = os.getenv("PREDICTIVE", "true").lower() == "true"
+    predict_horizon_seconds: int = int(os.getenv("PREDICT_HORIZON_SECONDS", "1800"))
+    predict_lookback: str = os.getenv("PREDICT_LOOKBACK", "30m")
+    # Only act on a forecast this confident it will breach, to avoid chasing
+    # noise. 0.95 means predicted to reach 95% of the limit.
+    predict_memory_threshold: float = float(os.getenv("PREDICT_MEMORY_THRESHOLD", "0.95"))
+
     # Blast radius. Per-target cooldowns do not help during a cluster-wide
     # incident, where every target is distinct and the Guardian would happily
     # restart everything at once. This caps total actions across all targets.
@@ -90,6 +100,18 @@ ANOMALIES_DETECTED = Counter(
     'guardian_anomalies_detected_total',
     'Total anomalies detected',
     ['type', 'severity']
+)
+
+PREDICTED_BREACHES = Counter(
+    'guardian_predicted_breaches_total',
+    'Resource limit breaches forecast before they happened',
+    ['resource']
+)
+
+PREDICTED_SECONDS_TO_BREACH = Gauge(
+    'guardian_predicted_seconds_to_breach',
+    'Forecast seconds until a pod reaches its limit',
+    ['pod', 'resource']
 )
 
 ACTIONS_TAKEN = Counter(
@@ -147,6 +169,7 @@ class ActionType(Enum):
     SCALE_UP = "scale_up"
     SCALE_DOWN = "scale_down"
     CORDON_NODE = "cordon_node"
+    ROLLBACK_CANARY = "rollback_canary"
 
 
 class Severity(Enum):
@@ -246,6 +269,7 @@ class KubernetesController:
         self.core_v1 = client.CoreV1Api()
         self.apps_v1 = client.AppsV1Api()
         self.coordination_v1 = client.CoordinationV1Api()
+        self.custom_objects = client.CustomObjectsApi()
 
     def restart_pod(self, name: str, namespace: str) -> Action:
         """Delete a pod to trigger restart."""
@@ -486,6 +510,68 @@ class KubernetesController:
         except Exception as e:
             logger.debug(f"Lease release skipped: {e}")
 
+    def rollback_canary(self, name: str, namespace: str) -> Action:
+        """Send all traffic back to the stable subset.
+
+        A rollback is a weight change on the VirtualService, not a redeploy, so
+        it takes effect as fast as Istio can push config rather than as fast as
+        pods can restart.
+        """
+        action = Action(
+            type=ActionType.ROLLBACK_CANARY,
+            target=f"{namespace}/{name}",
+            reason="Canary error rate above gate",
+        )
+
+        if self.dry_run:
+            action.success = True
+            action.result = "DRY RUN - would shift traffic back to stable"
+            logger.info(f"[DRY RUN] Would roll back canary {namespace}/{name}")
+            return action
+
+        try:
+            vs = self.custom_objects.get_namespaced_custom_object(
+                group="networking.istio.io", version="v1beta1",
+                namespace=namespace, plural="virtualservices", name=name,
+            )
+
+            changed = False
+            for route in vs.get("spec", {}).get("http", []):
+                destinations = route.get("route", [])
+                # Skip the header-pinned rule: that one is for deliberate
+                # testing and should keep working during a rollback.
+                if len(destinations) < 2:
+                    continue
+                for dest in destinations:
+                    subset = dest.get("destination", {}).get("subset")
+                    if subset == "stable" and dest.get("weight") != 100:
+                        dest["weight"] = 100
+                        changed = True
+                    elif subset == "canary" and dest.get("weight") != 0:
+                        dest["weight"] = 0
+                        changed = True
+
+            if not changed:
+                action.success = True
+                action.result = "Already fully on stable, nothing to roll back"
+                return action
+
+            self.custom_objects.patch_namespaced_custom_object(
+                group="networking.istio.io", version="v1beta1",
+                namespace=namespace, plural="virtualservices", name=name, body=vs,
+            )
+            action.success = True
+            action.result = "Traffic shifted back to stable (canary weight 0)"
+            logger.info(f"Rolled back canary {namespace}/{name}")
+            ACTIONS_TAKEN.labels(action="rollback_canary", target=namespace).inc()
+        except Exception as e:
+            reason = getattr(e, "reason", e)
+            action.result = f"Failed to roll back canary: {reason}"
+            logger.error(f"Canary rollback failed for {namespace}/{name}: {e}")
+            ACTIONS_FAILED.labels(action="rollback_canary", target=namespace).inc()
+
+        return action
+
     def get_pods(self, namespace: str, label_selector: str = "") -> List:
         """Get pods in namespace."""
         try:
@@ -657,6 +743,75 @@ class Guardian:
 
         return anomalies
 
+    async def check_predicted_memory_exhaustion(self) -> List[Anomaly]:
+        """Forecast pods heading for an OOM kill and scale before it lands.
+
+        A threshold check fires at 85% and by then the pod may be seconds from
+        being killed. predict_linear extrapolates the working-set trend over the
+        lookback window, so a slow leak is caught while there is still time to
+        add a replica.
+
+        Only a rising trend counts. A pod sitting flat at 84% is not going
+        anywhere and does not need action.
+        """
+        if not self.config.predictive:
+            return []
+
+        anomalies = []
+        horizon = self.config.predict_horizon_seconds
+        lookback = self.config.predict_lookback
+        ns = self.config.namespace
+
+        # Predicted usage as a fraction of the limit, horizon seconds from now.
+        query = f'''
+            (
+              predict_linear(
+                container_memory_working_set_bytes{{namespace="{ns}", container!=""}}[{lookback}],
+                {horizon}
+              )
+              / on(pod) group_left()
+              sum by (pod) (
+                kube_pod_container_resource_limits{{namespace="{ns}", resource="memory"}}
+              )
+            )
+            and
+            deriv(container_memory_working_set_bytes{{namespace="{ns}", container!=""}}[{lookback}]) > 0
+        '''
+        results = await self.prometheus.query(query)
+
+        for result in results:
+            try:
+                predicted_ratio = float(result["value"][1])
+            except (ValueError, KeyError, IndexError):
+                continue
+
+            pod = result["metric"].get("pod", "unknown")
+
+            if predicted_ratio < self.config.predict_memory_threshold:
+                continue
+
+            # Rough time-to-breach for the operator, derived from the same trend.
+            seconds_to_breach = horizon
+            if predicted_ratio > 0:
+                seconds_to_breach = int(horizon / predicted_ratio)
+            PREDICTED_SECONDS_TO_BREACH.labels(pod=pod, resource="memory").set(seconds_to_breach)
+            PREDICTED_BREACHES.labels(resource="memory").inc()
+
+            anomalies.append(Anomaly(
+                type="predicted_memory_exhaustion",
+                severity=Severity.WARNING,
+                target=pod,
+                message=(
+                    f"Memory trending to {predicted_ratio * 100:.0f}% of limit "
+                    f"within {horizon // 60}m; acting before the OOM kill"
+                ),
+                value=predicted_ratio,
+                suggested_action=ActionType.SCALE_UP,
+                metadata={**result["metric"], "seconds_to_breach": str(seconds_to_breach)},
+            ))
+
+        return anomalies
+
     async def check_service_health(self) -> List[Anomaly]:
         """Check if services are healthy."""
         anomalies = []
@@ -766,6 +921,11 @@ class Guardian:
                         deployment, self.config.namespace, new_replicas, ActionType.SCALE_UP
                     )
 
+        elif anomaly.suggested_action == ActionType.ROLLBACK_CANARY:
+            # The alert names the VirtualService via its service label.
+            vs_name = anomaly.metadata.get("virtualservice") or f"{target}-canary"
+            action = self.k8s.rollback_canary(vs_name, self.config.namespace)
+
         elif anomaly.suggested_action == ActionType.CORDON_NODE:
             node = anomaly.metadata.get("node") or target
             action = self.k8s.cordon_node(node)
@@ -832,6 +992,7 @@ class Guardian:
             self.check_crash_loops(),
             self.check_high_cpu(),
             self.check_high_memory(),
+            self.check_predicted_memory_exhaustion(),
             self.check_service_health(),
             self.check_prometheus_alerts(),
         ]

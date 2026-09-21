@@ -1,0 +1,177 @@
+---
+# Vault bootstrap.
+#
+# The setup script already existed but lived in a ConfigMap that nothing ever
+# ran, so Vault came up sealed and empty and no workload could use it. This
+# runs it, and stores the unseal key and root token in a Kubernetes Secret
+# rather than echoing them to pod logs where anyone with log access can read
+# them for as long as the logs are kept.
+#
+# A single unseal share is a deliberate free-tier tradeoff. Real deployments
+# split the shares between people, or use cloud KMS auto-unseal.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vault-bootstrap
+  namespace: vault
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: vault-bootstrap
+  namespace: vault
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: vault-bootstrap
+  namespace: vault
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+subjects:
+  - kind: ServiceAccount
+    name: vault-bootstrap
+    namespace: vault
+roleRef:
+  kind: Role
+  name: vault-bootstrap
+  apiGroup: rbac.authorization.k8s.io
+---
+# Vault's Kubernetes auth method validates service account tokens through the
+# TokenReview API, which requires this cluster-scoped binding.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: vault-token-reviewer
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+subjects:
+  - kind: ServiceAccount
+    name: vault
+    namespace: vault
+roleRef:
+  kind: ClusterRole
+  name: system:auth-delegator
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vault-bootstrap
+  namespace: vault
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  backoffLimit: 5
+  template:
+    spec:
+      serviceAccountName: vault-bootstrap
+      restartPolicy: OnFailure
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 100
+      volumes:
+        - name: keys
+          emptyDir: {}
+      initContainers:
+        # The Vault image carries the vault CLI but no kubectl, so the work is
+        # split: configure Vault here, hand the keys over on a shared volume.
+        - name: init-vault
+          image: hashicorp/vault:1.15.4
+          env:
+            - name: VAULT_ADDR
+              value: "http://vault.vault.svc.cluster.local:8200"
+          volumeMounts:
+            - name: keys
+              mountPath: /keys
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+
+              echo "waiting for Vault to respond"
+              i=0
+              while [ "$i" -lt 60 ]; do
+                # Exit 2 means sealed but reachable, which is expected here.
+                if vault status >/dev/null 2>&1; then break; fi
+                if [ "$?" = "2" ]; then break; fi
+                i=$((i + 1))
+                sleep 5
+              done
+
+              if vault status 2>/dev/null | grep -q "Initialized.*true"; then
+                echo "already initialized, nothing to do"
+                echo skip > /keys/state
+                exit 0
+              fi
+
+              # Default output format keeps the parsing free of escaping.
+              vault operator init -key-shares=1 -key-threshold=1 > /keys/init.txt
+              awk '/^Unseal Key 1:/ {printf "%s", $NF}' /keys/init.txt > /keys/unseal-key
+              awk '/^Initial Root Token:/ {printf "%s", $NF}' /keys/init.txt > /keys/root-token
+              rm -f /keys/init.txt
+              echo store > /keys/state
+
+              UNSEAL_KEY=$(cat /keys/unseal-key)
+              vault operator unseal "$UNSEAL_KEY" >/dev/null
+              VAULT_TOKEN=$(cat /keys/root-token)
+              export VAULT_TOKEN
+
+              vault secrets enable -path=nextopus kv-v2
+
+              vault policy write nextopus-app - <<'POLICY'
+              path "nextopus/data/*" {
+                capabilities = ["read", "list"]
+              }
+              POLICY
+
+              vault auth enable kubernetes
+              vault write auth/kubernetes/config kubernetes_host="https://kubernetes.default.svc.cluster.local:443"
+
+              # Named service accounts rather than a wildcard: otherwise any
+              # pod in the namespace could read every application secret.
+              vault write auth/kubernetes/role/nextopus-app bound_service_account_names=data-processor,data-generator bound_service_account_namespaces=nextopus policies=nextopus-app ttl=1h
+
+              vault kv put nextopus/config api_key="rotate-me" environment="production"
+
+              echo "vault configured"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+      containers:
+        # Keys land in a Secret rather than the pod logs.
+        - name: store-keys
+          image: rancher/kubectl:v1.31.2
+          volumeMounts:
+            - name: keys
+              mountPath: /keys
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              STATE=$(cat /keys/state 2>/dev/null || echo skip)
+              if [ "$STATE" = "skip" ]; then
+                echo "Vault was already initialized; no new keys to store"
+                exit 0
+              fi
+              kubectl create secret generic vault-keys -n vault --from-file=unseal-key=/keys/unseal-key --from-file=root-token=/keys/root-token --dry-run=client -o yaml | kubectl apply -f -
+              echo "keys stored in secret/vault-keys, not in these logs"
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi

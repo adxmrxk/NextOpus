@@ -83,7 +83,7 @@ async def test_retention_drops_everything_when_all_expired():
     store = main.EventStore(max_events=1000, retention_hours=1)
     await store.add_events([ev(f"o{i}", hours_ago=9 - i) for i in range(3)])
     await store.cleanup_old_events()
-    assert store.events == []
+    assert len(store.events) == 0
 
 
 @pytest.mark.asyncio
@@ -99,7 +99,7 @@ async def test_retention_handles_naive_timestamps():
     store = main.EventStore(max_events=1000, retention_hours=1)
     await store.add_events([ev("naive_old", hours_ago=4, naive=True)])
     await store.cleanup_old_events()
-    assert store.events == []
+    assert len(store.events) == 0
 
 
 @pytest.mark.asyncio
@@ -117,3 +117,64 @@ async def test_aggregate_metrics_averages_numeric_fields(store):
 @pytest.mark.asyncio
 async def test_aggregate_metrics_empty_for_unknown_type(store):
     assert await store.aggregate_metrics("nope") == []
+
+
+# ---------------------------------------------------------------------------
+# Performance-related invariants
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_aggregation_cache_is_invalidated_by_writes():
+    """A stale cache is worse than a slow one."""
+    store = main.EventStore(max_events=1000, retention_hours=24)
+    await store.add_events([ev("a", data={"cpu_usage": 10.0})])
+    first = await store.aggregate_metrics("metric")
+    assert first[0].value == pytest.approx(10.0)
+
+    await store.add_events([ev("b", data={"cpu_usage": 20.0})])
+    second = await store.aggregate_metrics("metric")
+    assert second[0].value == pytest.approx(15.0), "cache served a stale average"
+
+
+@pytest.mark.asyncio
+async def test_aggregation_cache_is_reused_when_nothing_changed():
+    store = main.EventStore(max_events=1000, retention_hours=24)
+    await store.add_events([ev("a", data={"cpu_usage": 10.0})])
+    first = await store.aggregate_metrics("metric")
+    second = await store.aggregate_metrics("metric")
+    assert first is second, "identical call recomputed instead of reusing"
+
+
+@pytest.mark.asyncio
+async def test_retention_invalidates_the_cache():
+    store = main.EventStore(max_events=1000, retention_hours=1)
+    await store.add_events([ev("old", hours_ago=5, data={"cpu_usage": 10.0})])
+    await store.add_events([ev("new", data={"cpu_usage": 20.0})])
+    await store.aggregate_metrics("metric")          # warm it
+    await store.cleanup_old_events()
+    after = await store.aggregate_metrics("metric")
+    assert after[0].value == pytest.approx(20.0), "cache survived an eviction"
+
+
+@pytest.mark.asyncio
+async def test_id_index_stays_consistent_through_eviction():
+    """The by-id index must not leak entries for evicted events."""
+    store = main.EventStore(max_events=50, retention_hours=24)
+    await store.add_events([ev(f"e{i}") for i in range(200)])
+
+    assert len(store.events) == 50
+    assert len(store._by_id) == 50, "id index leaked evicted events"
+    assert await store.get_by_id("e0") is None, "evicted event still resolvable"
+    assert await store.get_by_id("e199") is not None
+
+
+@pytest.mark.asyncio
+async def test_type_and_source_indexes_stay_consistent_through_eviction():
+    store = main.EventStore(max_events=50, retention_hours=24)
+    await store.add_events([
+        ev(f"e{i}", etype=f"t{i % 3}", source=f"s{i % 2}") for i in range(200)
+    ])
+    by_type = sum(len(v) for v in store.events_by_type.values())
+    by_source = sum(len(v) for v in store.events_by_source.values())
+    assert by_type == 50, f"type index holds {by_type}, store holds 50"
+    assert by_source == 50, f"source index holds {by_source}, store holds 50"

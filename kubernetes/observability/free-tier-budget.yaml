@@ -1,0 +1,165 @@
+---
+# Free-tier budget guardrail.
+#
+# The entire premise is that this runs for nothing. That premise is fragile in
+# a way ordinary resource alerts do not catch: on Oracle Always Free you do not
+# get billed for exceeding a limit, the request simply fails. So the failure
+# mode is not a surprise invoice, it is a deploy that mysteriously will not
+# schedule, weeks after somebody bumped a replica count.
+#
+# These rules track consumption against the actual free-tier ceilings and warn
+# while there is still headroom to do something about it.
+#
+#   Always Free:  4 OCPU · 24 GB RAM · 200 GB block storage · 10 TB egress/mo
+#
+# The instances are sized to consume that exactly, so there is no slack: any
+# growth has to come out of something else.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: nextopus-free-tier-budget
+  namespace: observability
+  labels:
+    app: nextopus
+    prometheus: kube-prometheus
+    role: budget-rules
+spec:
+  groups:
+    - name: nextopus.freetier.capacity
+      interval: 60s
+      rules:
+        # What the cluster physically has, which should equal the free-tier
+        # allowance. If it does not, someone changed the Terraform.
+        - record: nextopus:cluster_cpu_cores:total
+          expr: sum(kube_node_status_capacity{resource="cpu"})
+
+        - record: nextopus:cluster_memory_bytes:total
+          expr: sum(kube_node_status_capacity{resource="memory"})
+
+        # Requests, not usage. Scheduling fails on requests, so this is the
+        # number that decides whether the next pod starts.
+        - record: nextopus:cluster_cpu_requested:ratio
+          expr: |
+            sum(kube_pod_container_resource_requests{resource="cpu"})
+            /
+            clamp_min(sum(kube_node_status_allocatable{resource="cpu"}), 0.001)
+
+        - record: nextopus:cluster_memory_requested:ratio
+          expr: |
+            sum(kube_pod_container_resource_requests{resource="memory"})
+            /
+            clamp_min(sum(kube_node_status_allocatable{resource="memory"}), 1)
+
+        # Headroom expressed the way a human thinks about it: how many more
+        # average-sized pods fit before scheduling starts failing.
+        - record: nextopus:schedulable_pods:remaining
+          expr: |
+            (
+              sum(kube_node_status_allocatable{resource="memory"})
+              -
+              sum(kube_pod_container_resource_requests{resource="memory"})
+            )
+            /
+            clamp_min(
+              avg(kube_pod_container_resource_requests{resource="memory"} > 0), 1
+            )
+
+        - record: nextopus:persistent_storage_bytes:requested
+          expr: sum(kube_persistentvolumeclaim_resource_requests_storage_bytes)
+
+        # Fraction of the 200 GB block storage allowance in use. Boot volumes
+        # already consume all of it, so any PVC backed by a real block volume
+        # rather than local-path is over the line.
+        - record: nextopus:free_tier_storage:ratio
+          expr: |
+            sum(kube_persistentvolumeclaim_resource_requests_storage_bytes)
+            / (200 * 1024 * 1024 * 1024)
+
+    - name: nextopus.freetier.alerts
+      interval: 60s
+      rules:
+        - alert: FreeTierCPUNearlyCommitted
+          expr: nextopus:cluster_cpu_requested:ratio > 0.85
+          for: 10m
+          labels:
+            severity: warning
+            budget: free-tier
+          annotations:
+            summary: "CPU requests at {{ $value | humanizePercentage }} of allocatable"
+            description: >-
+              There are only 4 OCPUs and they cannot be increased without
+              leaving the free tier. The next deploy may fail to schedule.
+              Reduce requests or remove a workload.
+
+        - alert: FreeTierMemoryNearlyCommitted
+          expr: nextopus:cluster_memory_requested:ratio > 0.85
+          for: 10m
+          labels:
+            severity: warning
+            budget: free-tier
+          annotations:
+            summary: "Memory requests at {{ $value | humanizePercentage }} of allocatable"
+            description: >-
+              24 GB is the hard ceiling. Pods will start going Pending rather
+              than the bill going up.
+
+        - alert: FreeTierCapacityExhausted
+          expr: |
+            nextopus:cluster_memory_requested:ratio > 0.95
+            or
+            nextopus:cluster_cpu_requested:ratio > 0.95
+          for: 5m
+          labels:
+            severity: critical
+            budget: free-tier
+          annotations:
+            summary: "Free-tier capacity effectively exhausted"
+            description: >-
+              Above 95% committed. Anything new will sit Pending, and the
+              Guardian cannot scale up either, so it will keep trying and
+              failing to remediate.
+
+        - alert: FreeTierStorageExceeded
+          expr: nextopus:free_tier_storage:ratio > 1
+          for: 5m
+          labels:
+            severity: critical
+            budget: free-tier
+          annotations:
+            summary: "Storage requests exceed the 200 GB free allowance"
+            description: >-
+              PVCs now request {{ $value | humanizePercentage }} of the free
+              block-storage allowance. The four 50 GB boot volumes already use
+              all 200 GB, so this only stays free while PVCs are served by
+              local-path off the existing disks.
+
+        # The Guardian scales up to relieve pressure. On a fixed-size cluster
+        # that eventually stops working, and it is worth knowing before the
+        # Guardian starts failing every remediation it attempts.
+        - alert: FreeTierBlocksAutoscaling
+          expr: |
+            nextopus:cluster_memory_requested:ratio > 0.9
+            and
+            rate(guardian_actions_taken_total{action="scale"}[30m]) > 0
+          for: 10m
+          labels:
+            severity: warning
+            budget: free-tier
+          annotations:
+            summary: "Guardian is scaling up into a nearly full cluster"
+            description: >-
+              Scale-ups are being attempted with under 10% memory headroom.
+              New replicas will go Pending, so the remediation will not help.
+
+        - alert: NodeCapacityChangedUnexpectedly
+          expr: nextopus:cluster_cpu_cores:total != 4
+          for: 15m
+          labels:
+            severity: warning
+            budget: free-tier
+          annotations:
+            summary: "Cluster is not 4 OCPUs"
+            description: >-
+              Total CPU capacity is {{ $value }}, not the 4 the free tier
+              allows. Either a node is down, or the Terraform was changed in a
+              way that will be billable.

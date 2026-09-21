@@ -8,10 +8,10 @@ import logging
 import os
 import signal
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional
 from contextlib import asynccontextmanager
 
 import uvicorn
@@ -145,16 +145,45 @@ class ProcessorStats(BaseModel):
 # ==============================================================================
 
 class EventStore:
-    """In-memory event store with time-based eviction."""
+    """In-memory event store with time-based eviction.
+
+    Events are appended in arrival order and only ever evicted from the front,
+    which makes every index a FIFO queue too: the oldest event of a given type
+    is always at the head of that type's deque. That invariant is what lets
+    eviction and retention be O(1) per event instead of scanning.
+    """
 
     def __init__(self, max_events: int = 100000, retention_hours: int = 24):
-        self.events: List[DataEvent] = []
-        self.events_by_type: Dict[str, List[DataEvent]] = defaultdict(list)
-        self.events_by_source: Dict[str, List[DataEvent]] = defaultdict(list)
+        self.events: Deque[DataEvent] = deque()
+        self.events_by_type: Dict[str, Deque[DataEvent]] = defaultdict(deque)
+        self.events_by_source: Dict[str, Deque[DataEvent]] = defaultdict(deque)
+        # Direct lookup for the by-id endpoint, which otherwise scans.
+        self._by_id: Dict[str, DataEvent] = {}
         self.max_events = max_events
         self.retention_hours = retention_hours
         self.start_time = _utcnow()
         self._lock = asyncio.Lock()
+        # Aggregating is a full pass over a type; cache until the data moves.
+        self._version = 0
+        self._agg_cache: Dict[str, tuple] = {}
+
+    def _evict_oldest(self) -> None:
+        """Drop the front event. O(1): it heads every index."""
+        old = self.events.popleft()
+        by_type = self.events_by_type.get(old.type)
+        if by_type:
+            by_type.popleft()
+            if not by_type:
+                del self.events_by_type[old.type]
+        by_source = self.events_by_source.get(old.source)
+        if by_source:
+            by_source.popleft()
+            if not by_source:
+                del self.events_by_source[old.source]
+        # Only drop the id mapping if it still points at this event; a reused
+        # id may already have been overwritten by a newer arrival.
+        if self._by_id.get(old.id) is old:
+            del self._by_id[old.id]
 
     async def add_events(self, events: List[DataEvent]) -> int:
         """Add events to the store."""
@@ -163,18 +192,23 @@ class EventStore:
             for event in events:
                 event.timestamp = _as_aware(event.timestamp)
                 if len(self.events) >= self.max_events:
-                    # Remove oldest event
-                    old_event = self.events.pop(0)
-                    self.events_by_type[old_event.type].remove(old_event)
-                    self.events_by_source[old_event.source].remove(old_event)
+                    self._evict_oldest()
 
                 self.events.append(event)
                 self.events_by_type[event.type].append(event)
                 self.events_by_source[event.source].append(event)
+                self._by_id[event.id] = event
                 added += 1
 
+            if added:
+                self._version += 1
             EVENTS_IN_MEMORY.set(len(self.events))
             return added
+
+    async def get_by_id(self, event_id: str) -> Optional[DataEvent]:
+        """Direct lookup rather than scanning every event."""
+        async with self._lock:
+            return self._by_id.get(event_id)
 
     async def query(
         self,
@@ -190,9 +224,9 @@ class EventStore:
         async with self._lock:
             # Start with appropriate subset
             if event_type:
-                candidates = self.events_by_type.get(event_type, [])
+                candidates = self.events_by_type.get(event_type, ())
             elif source:
-                candidates = self.events_by_source.get(source, [])
+                candidates = self.events_by_source.get(source, ())
             else:
                 candidates = self.events
 
@@ -235,7 +269,13 @@ class EventStore:
     async def aggregate_metrics(self, event_type: str = "metric") -> List[AggregationResult]:
         """Aggregate numeric metrics from events."""
         async with self._lock:
-            events = self.events_by_type.get(event_type, [])
+            # A full pass over the type. Nothing changes between writes, so
+            # repeated dashboard polls reuse the previous answer.
+            cached = self._agg_cache.get(event_type)
+            if cached and cached[0] == self._version:
+                return cached[1]
+
+            events = self.events_by_type.get(event_type, ())
             if not events:
                 return []
 
@@ -264,35 +304,27 @@ class EventStore:
                     ))
 
             AGGREGATIONS_COMPUTED.inc()
+            self._agg_cache[event_type] = (self._version, results)
             return results
 
     async def cleanup_old_events(self):
-        """Remove events older than retention period."""
+        """Remove events older than the retention period.
+
+        Events are ordered by arrival, so everything expired sits at the front.
+        Popping from the head is O(1) each; the previous version rebuilt both
+        index lists and then searched them for every removed event.
+        """
         async with self._lock:
             cutoff = _utcnow() - timedelta(hours=self.retention_hours)
 
-            # Events are appended in arrival order, so the expired set is a
-            # prefix. Default to len(events): if nothing is inside the retention
-            # window, every event is expired. (Defaulting to 0 meant a fully
-            # expired store evicted nothing.)
-            cutoff_idx = len(self.events)
-            for i, event in enumerate(self.events):
-                if _as_aware(event.timestamp) >= cutoff:
-                    cutoff_idx = i
-                    break
+            removed = 0
+            while self.events and _as_aware(self.events[0].timestamp) < cutoff:
+                self._evict_oldest()
+                removed += 1
 
-            if cutoff_idx > 0:
-                removed_events = self.events[:cutoff_idx]
-                self.events = self.events[cutoff_idx:]
-
-                # Update indexes
-                for event in removed_events:
-                    if event in self.events_by_type[event.type]:
-                        self.events_by_type[event.type].remove(event)
-                    if event in self.events_by_source[event.source]:
-                        self.events_by_source[event.source].remove(event)
-
-                logger.info(f"Cleaned up {len(removed_events)} old events")
+            if removed:
+                self._version += 1
+                logger.info(f"Cleaned up {removed} old events")
                 EVENTS_IN_MEMORY.set(len(self.events))
 
 
@@ -440,11 +472,10 @@ async def query_events(
 @app.get("/events/{event_id}")
 async def get_event(event_id: str):
     """Get a specific event by ID."""
-    events = await store.query(limit=10000)
-    for event in events:
-        if event.id == event_id:
-            return event
-    raise HTTPException(status_code=404, detail="Event not found")
+    event = await store.get_by_id(event_id)
+    if event is None:
+        raise HTTPException(status_code=404, detail="Event not found")
+    return event
 
 
 @app.get("/stats")

@@ -84,6 +84,7 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write      # keyless signing via the GitHub OIDC provider
     steps:
       - uses: actions/checkout@v4
 
@@ -110,7 +111,11 @@ jobs:
             type=ref,event=branch
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v5
         with:
           context: services/data-generator
@@ -120,6 +125,35 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # Ship an SBOM and build provenance with the image so what is inside
+          # it is auditable after the fact.
+          sbom: true
+          provenance: mode=max
+
+      - name: Sign the image
+        # Keyless: identity comes from the workflow's OIDC token and the
+        # signature goes to the public Rekor log. No private key to leak.
+        # Signs the digest, not a tag, because tags move.
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE: ${{ env.REGISTRY }}/${{ github.repository_owner }}/data-generator
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
+
+      - name: Scan for vulnerabilities
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ github.repository_owner }}/data-generator@${{ steps.build.outputs.digest }}
+          format: sarif
+          output: trivy-data-generator.sarif
+          severity: CRITICAL,HIGH
+          exit-code: '0'      # report, do not block, until the backlog is clean
+
+      - name: Upload scan results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-data-generator.sarif
+          category: data-generator
 
   # ===========================================================================
   # Data Processor (Python)
@@ -161,6 +195,7 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write      # keyless signing via the GitHub OIDC provider
     steps:
       - uses: actions/checkout@v4
 
@@ -187,7 +222,11 @@ jobs:
             type=ref,event=branch
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v5
         with:
           context: services/data-processor
@@ -197,6 +236,35 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # Ship an SBOM and build provenance with the image so what is inside
+          # it is auditable after the fact.
+          sbom: true
+          provenance: mode=max
+
+      - name: Sign the image
+        # Keyless: identity comes from the workflow's OIDC token and the
+        # signature goes to the public Rekor log. No private key to leak.
+        # Signs the digest, not a tag, because tags move.
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE: ${{ env.REGISTRY }}/${{ github.repository_owner }}/data-processor
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
+
+      - name: Scan for vulnerabilities
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ github.repository_owner }}/data-processor@${{ steps.build.outputs.digest }}
+          format: sarif
+          output: trivy-data-processor.sarif
+          severity: CRITICAL,HIGH
+          exit-code: '0'      # report, do not block, until the backlog is clean
+
+      - name: Upload scan results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-data-processor.sarif
+          category: data-processor
 
   # ===========================================================================
   # Guardian (Python)
@@ -235,6 +303,7 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write      # keyless signing via the GitHub OIDC provider
     steps:
       - uses: actions/checkout@v4
 
@@ -261,7 +330,11 @@ jobs:
             type=ref,event=branch
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v5
         with:
           context: scripts/guardian
@@ -271,3 +344,32 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # Ship an SBOM and build provenance with the image so what is inside
+          # it is auditable after the fact.
+          sbom: true
+          provenance: mode=max
+
+      - name: Sign the image
+        # Keyless: identity comes from the workflow's OIDC token and the
+        # signature goes to the public Rekor log. No private key to leak.
+        # Signs the digest, not a tag, because tags move.
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE: ${{ env.REGISTRY }}/${{ github.repository_owner }}/guardian
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
+
+      - name: Scan for vulnerabilities
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ github.repository_owner }}/guardian@${{ steps.build.outputs.digest }}
+          format: sarif
+          output: trivy-guardian.sarif
+          severity: CRITICAL,HIGH
+          exit-code: '0'      # report, do not block, until the backlog is clean
+
+      - name: Upload scan results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-guardian.sarif
+          category: guardian

@@ -31,7 +31,13 @@ A Python controller that queries Prometheus over PromQL and acts through the Kub
 | High CPU | ≥80% of limit, 5m average | Scale up, max 10 |
 | High memory | ≥85% of limit | Scale up |
 | Service down | All replicas unhealthy | Restart pods |
+| **Predicted OOM** | `predict_linear` says a rising pod reaches its limit within 30m | Scale up *before* the kill |
+| Failing canary | v2 subset over 5% 5xx | Shift traffic back to stable |
 | Custom alert | Any alert with a `guardian_action` label | Per the label |
+
+Prediction is the difference between restarting after a crash and adding a
+replica while there is still time. A flat pod near its limit is ignored: the
+query gates on `deriv() > 0`, so only a rising trend counts.
 
 **Safety.** It does destructive things, so:
 
@@ -47,6 +53,40 @@ curl localhost:8080/status      # leadership + remaining action budget
 curl localhost:8080/anomalies   # what it currently sees
 curl localhost:8080/actions     # what it has done
 ```
+
+## Supply Chain
+
+CI signs every image with **cosign keyless** — identity comes from the
+workflow's OIDC token and the signature goes to the public Rekor log, so there
+is no private key to leak or rotate. Images ship with an SBOM and build
+provenance, and Trivy scans them.
+
+Kyverno then verifies that signature at admission, pinned to the exact workflow
+and branch allowed to publish:
+
+```yaml
+keyless:
+  subject: ".../.github/workflows/ci.yaml@refs/heads/main"
+  issuer:  "https://token.actions.githubusercontent.com"
+```
+
+A signature from any other workflow, repo or fork does not satisfy it. It runs
+in `Audit` until a signed build has rolled out; one field flips it to `Enforce`,
+after which an unsigned or tampered image is rejected outright.
+
+## Progressive Delivery
+
+`data-processor` ships behind an Istio traffic split. The canary takes 0% by
+default and is reachable on demand with `x-nextopus-canary: true`, so a new
+version can be exercised before any real traffic moves onto it. Raise the
+weight to roll out.
+
+If the canary's own error rate passes 5%, an alert labelled
+`guardian_action: rollback_canary` fires and the Guardian sets the weight back
+to zero. Rollback is a config push rather than a redeploy, so it lands as fast
+as Istio can distribute it. The rate is measured on the **canary subset only** —
+a canary taking 10% of traffic can be failing completely while the service
+average still looks fine.
 
 ## Quick start
 
@@ -105,6 +145,18 @@ kubectl -n nextopus logs job/chaos-self-healing-test
 ```
 
 It lives outside every ArgoCD path deliberately — the guardian app syncs with `selfHeal`, so a Job stored there would kill a pod on every sync.
+
+**Free-tier budget.** `free-tier-budget.yaml` tracks requests against the real
+ceilings (4 OCPU, 24 GB, 200 GB). On Always Free you are not billed for
+overrunning, the request just fails, so the failure mode is a deploy that
+silently will not schedule weeks after someone bumped a replica count. It also
+catches the Guardian scaling up into a full cluster, where the remediation
+cannot possibly work.
+
+**Vault** is bootstrapped by a Job that initialises, unseals, enables
+Kubernetes auth and writes a scoped policy. The unseal key and root token go
+into `secret/vault-keys` rather than the pod logs. Auth is bound to named
+service accounts, not a namespace wildcard.
 
 **SLOs** in `kubernetes/observability/slo.yaml` measure the "removes toil" claim: availability and latency SLIs, multi-window burn-rate alerts so blips stay quiet, and alerts on the healer itself being broken, thrashing, leaderless, or wedged.
 

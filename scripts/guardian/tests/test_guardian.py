@@ -70,6 +70,11 @@ class FakeK8s:
         return G.Action(type=G.ActionType.CORDON_NODE, target=name,
                         reason="test", success=True, result="cordoned")
 
+    def rollback_canary(self, name, namespace):
+        self.calls.append(("rollback_canary", name))
+        return G.Action(type=G.ActionType.ROLLBACK_CANARY, target=f"{namespace}/{name}",
+                        reason="test", success=True, result="shifted to stable")
+
     def emit_event(self, reason, message, namespace, involved_name,
                    involved_kind="Pod", event_type="Normal"):
         self.events.append({"reason": reason, "target": involved_name, "type": event_type})
@@ -511,3 +516,118 @@ async def test_status_reports_breaker_budget(api):
     assert body["circuit_breaker"]["limit"] > 0
     assert body["circuit_breaker"]["open"] is False
     assert "leader" in body
+
+
+# ---------------------------------------------------------------------------
+# Predictive remediation
+# ---------------------------------------------------------------------------
+
+async def test_predicts_memory_exhaustion_before_it_happens():
+    """A pod trending toward its limit is acted on before the OOM kill."""
+    g = make_guardian(FakePrometheus({
+        "predict_linear": sample({"pod": "data-processor-abc-xyz"}, 1.3)
+    }))
+    (a,) = await g.check_predicted_memory_exhaustion()
+    assert a.type == "predicted_memory_exhaustion"
+    assert a.suggested_action is G.ActionType.SCALE_UP
+    assert "seconds_to_breach" in a.metadata
+
+
+async def test_ignores_forecast_below_threshold():
+    """A pod drifting slowly but not reaching the limit is left alone."""
+    g = make_guardian(FakePrometheus({
+        "predict_linear": sample({"pod": "data-processor-abc-xyz"}, 0.40)
+    }))
+    assert await g.check_predicted_memory_exhaustion() == []
+
+
+async def test_prediction_can_be_disabled():
+    g = make_guardian(FakePrometheus({
+        "predict_linear": sample({"pod": "p"}, 5.0)
+    }), predictive=False)
+    assert await g.check_predicted_memory_exhaustion() == []
+
+
+async def test_prediction_query_requires_a_rising_trend():
+    """A flat pod near its limit must not trigger: deriv > 0 gates it."""
+    g = make_guardian()
+    captured = {}
+
+    class Recording(FakePrometheus):
+        async def query(self, promql):
+            captured["q"] = promql
+            return []
+
+    g.prometheus = Recording()
+    await g.check_predicted_memory_exhaustion()
+    assert "deriv(" in captured["q"]
+    assert "> 0" in captured["q"]
+
+
+async def test_malformed_prediction_value_is_skipped():
+    g = make_guardian(FakePrometheus({
+        "predict_linear": [{"metric": {"pod": "p"}, "value": [0, "NaN-ish"]}]
+    }))
+    assert await g.check_predicted_memory_exhaustion() == []
+
+
+async def test_predictive_check_runs_in_the_cycle():
+    g = make_guardian(FakePrometheus({
+        "predict_linear": sample({"pod": "data-processor-abc-xyz"}, 1.5)
+    }), FakeK8s())
+    await g.run_check_cycle()
+    assert any(a.type == "predicted_memory_exhaustion" for a in g.active_anomalies)
+
+
+# ---------------------------------------------------------------------------
+# Progressive delivery
+# ---------------------------------------------------------------------------
+
+async def test_canary_alert_becomes_a_rollback():
+    """The guardian_action label is the whole contract; no canary-specific code."""
+    g = make_guardian(FakePrometheus(alerts=[{
+        "labels": {"alertname": "NextOpusCanaryFailing", "severity": "critical",
+                   "guardian_action": "rollback_canary", "service": "data-processor"},
+        "annotations": {"summary": "canary failing"},
+    }]))
+    (a,) = await g.check_prometheus_alerts()
+    assert a.suggested_action is G.ActionType.ROLLBACK_CANARY
+
+
+async def test_rollback_targets_the_virtualservice():
+    k8s = FakeK8s()
+    g = make_guardian(k8s=k8s)
+    a = G.Anomaly(type="alert_NextOpusCanaryFailing", severity=G.Severity.CRITICAL,
+                  target="data-processor", message="failing", value=0.2,
+                  suggested_action=G.ActionType.ROLLBACK_CANARY)
+    act = await g.remediate(a)
+    assert k8s.calls == [("rollback_canary", "data-processor-canary")]
+    assert act.type is G.ActionType.ROLLBACK_CANARY
+
+
+async def test_rollback_honours_explicit_virtualservice_name():
+    k8s = FakeK8s()
+    g = make_guardian(k8s=k8s)
+    a = G.Anomaly(type="alert", severity=G.Severity.CRITICAL, target="svc",
+                  message="", value=1, suggested_action=G.ActionType.ROLLBACK_CANARY,
+                  metadata={"virtualservice": "custom-vs"})
+    await g.remediate(a)
+    assert k8s.calls == [("rollback_canary", "custom-vs")]
+
+
+async def test_rollback_emits_an_event():
+    k8s = FakeK8s()
+    g = make_guardian(k8s=k8s)
+    a = G.Anomaly(type="alert", severity=G.Severity.CRITICAL, target="data-processor",
+                  message="", value=1, suggested_action=G.ActionType.ROLLBACK_CANARY)
+    await g.remediate(a)
+    assert any(e["reason"] == "Remediated" for e in k8s.events)
+
+
+async def test_rollback_respects_the_blast_radius_breaker():
+    k8s = FakeK8s()
+    g = make_guardian(k8s=k8s, max_actions_per_window=0)
+    a = G.Anomaly(type="alert", severity=G.Severity.CRITICAL, target="data-processor",
+                  message="", value=1, suggested_action=G.ActionType.ROLLBACK_CANARY)
+    assert await g.remediate(a) is None
+    assert k8s.calls == []

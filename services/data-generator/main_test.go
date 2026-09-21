@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -347,5 +349,97 @@ func TestFlushBufferWorksWithTracingDisabled(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("processor never received the batch")
+	}
+}
+
+// Exercises the exact interleaving that used to race: the producer reading the
+// buffer length while a flush truncates it. Run under -race (CI does) this
+// fails on the old code and passes on the new.
+func TestConcurrentProduceAndFlushIsRaceFree(t *testing.T) {
+	var received int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var events []DataEvent
+		body, _ := io.ReadAll(r.Body)
+		if json.Unmarshal(body, &events) == nil {
+			atomic.AddInt64(&received, int64(len(events)))
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	cfg := testConfig(srv.URL + "/ingest")
+	cfg.BatchSize = 8
+	g := NewGenerator(cfg)
+
+	var wg sync.WaitGroup
+	// Producers append and trigger flushes the way Run does.
+	for w := 0; w < 4; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 250; i++ {
+				if n := g.addToBuffer(g.generateEvent()); n >= cfg.BatchSize {
+					g.triggerFlush()
+				}
+			}
+		}()
+	}
+	// Concurrent readers, like the /stats handler under load.
+	for w := 0; w < 2; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 250; i++ {
+				rec := httptest.NewRecorder()
+				g.handleStats(rec, httptest.NewRequest(http.MethodGet, "/stats", nil))
+			}
+		}()
+	}
+	wg.Wait()
+
+	g.flushBuffer() // drain whatever the last trigger left behind
+
+	if n := len(g.buffer); n != 0 {
+		t.Errorf("buffer holds %d events after the final flush, want 0", n)
+	}
+	if atomic.LoadInt64(&received) == 0 {
+		t.Error("processor received nothing; flushes never ran")
+	}
+}
+
+// A flush already in progress must not spawn another one.
+func TestTriggerFlushIsBounded(t *testing.T) {
+	release := make(chan struct{})
+	var inFlight, maxInFlight int64
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cur := atomic.AddInt64(&inFlight, 1)
+		for {
+			old := atomic.LoadInt64(&maxInFlight)
+			if cur <= old || atomic.CompareAndSwapInt64(&maxInFlight, old, cur) {
+				break
+			}
+		}
+		<-release
+		atomic.AddInt64(&inFlight, -1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	g := NewGenerator(testConfig(srv.URL + "/ingest"))
+	for i := 0; i < 50; i++ {
+		g.addToBuffer(g.generateEvent())
+		g.triggerFlush()
+	}
+
+	close(release)
+	// Give the in-flight flush a moment to finish before asserting.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && atomic.LoadInt64(&inFlight) > 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if got := atomic.LoadInt64(&maxInFlight); got > 1 {
+		t.Errorf("%d concurrent flushes; triggerFlush should allow at most 1", got)
 	}
 }

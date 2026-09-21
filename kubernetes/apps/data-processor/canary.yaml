@@ -1,0 +1,142 @@
+---
+# Progressive delivery for data-processor.
+#
+# Until now Istio only enforced mTLS, which is a lot of mesh to run for one
+# feature. This makes it load bearing: a new version takes a small share of
+# real traffic first, and the Guardian rolls it back automatically if that
+# share starts erroring.
+#
+# The split is deliberately declarative. The canary Deployment carries
+# version: v2 and the stable one version: v1; the VirtualService decides how
+# much traffic each subset receives, so a rollback is a weight change rather
+# than a redeploy.
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: data-processor-subsets
+  namespace: nextopus
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  host: data-processor
+  trafficPolicy:
+    tls:
+      mode: ISTIO_MUTUAL
+    # Shed load rather than queue it: a canary that is failing should fail
+    # fast so the error rate moves quickly and the rollback triggers.
+    connectionPool:
+      tcp:
+        maxConnections: 100
+      http:
+        http1MaxPendingRequests: 50
+        maxRequestsPerConnection: 0
+    # Eject an instance that keeps returning 5xx, so a bad canary pod stops
+    # taking traffic even before the weight is changed.
+    outlierDetection:
+      consecutive5xxErrors: 5
+      interval: 10s
+      baseEjectionTime: 30s
+      maxEjectionPercent: 50
+  subsets:
+    - name: stable
+      labels:
+        version: v1
+    - name: canary
+      labels:
+        version: v2
+---
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: data-processor-canary
+  namespace: nextopus
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  hosts:
+    - data-processor
+  http:
+    # An explicit header pins a request to the canary, so the new version can
+    # be exercised deliberately before any real traffic is shifted onto it.
+    - match:
+        - headers:
+            x-nextopus-canary:
+              exact: "true"
+      route:
+        - destination:
+            host: data-processor
+            subset: canary
+    # Weighted split for everyone else. 0 means the canary is idle; the
+    # rollout raises it and a rollback sets it back to 0.
+    - route:
+        - destination:
+            host: data-processor
+            subset: stable
+          weight: 100
+        - destination:
+            host: data-processor
+            subset: canary
+          weight: 0
+      retries:
+        attempts: 2
+        perTryTimeout: 2s
+        retryOn: 5xx,reset,connect-failure
+---
+# Error rate of the canary subset specifically, so a rollback decision is made
+# on the new version's behaviour rather than the service average. A canary
+# taking 10% of traffic can be failing completely while the overall rate still
+# looks fine.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: nextopus-canary
+  namespace: observability
+  labels:
+    app: nextopus
+    prometheus: kube-prometheus
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  groups:
+    - name: nextopus.canary
+      interval: 15s
+      rules:
+        - record: nextopus:canary_error_ratio:rate2m
+          expr: |
+            sum(rate(istio_requests_total{
+              destination_service_name="data-processor",
+              destination_version="v2",
+              response_code=~"5.."
+            }[2m]))
+            /
+            clamp_min(sum(rate(istio_requests_total{
+              destination_service_name="data-processor",
+              destination_version="v2"
+            }[2m])), 1)
+
+        - record: nextopus:canary_request_rate:rate2m
+          expr: |
+            sum(rate(istio_requests_total{
+              destination_service_name="data-processor",
+              destination_version="v2"
+            }[2m]))
+
+        # guardian_action tells the Guardian to act on this without any
+        # canary-specific code: the label is the whole contract.
+        - alert: NextOpusCanaryFailing
+          expr: |
+            nextopus:canary_error_ratio:rate2m > 0.05
+            and
+            nextopus:canary_request_rate:rate2m > 0.1
+          for: 2m
+          labels:
+            severity: critical
+            service: data-processor
+            guardian_action: rollback_canary
+          annotations:
+            summary: "Canary is failing, rolling back"
+            description: >-
+              The v2 subset is returning {{ $value | humanizePercentage }} 5xx
+              over two minutes, above the 5% gate. Traffic is being returned to
+              stable. The request-rate condition stops this firing on a canary
+              that is receiving almost nothing.

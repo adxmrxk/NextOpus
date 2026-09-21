@@ -62,6 +62,57 @@ spec:
     admissionController:
       replicas: 1
 ---
+# Image provenance. Refuses to run a NextOpus image unless it carries a cosign
+# signature produced by this repository's CI workflow.
+#
+# Keyless verification: no public key to distribute or rotate. The signature is
+# checked against the Rekor transparency log and the identity is pinned to the
+# exact workflow and branch allowed to publish, so a signature from any other
+# workflow, repo or fork does not satisfy it.
+#
+# Audit for now so it reports without blocking. Flip to Enforce once a signed
+# build has rolled out, after which an unsigned or tampered image is rejected
+# at admission.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: verify-image-signatures
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+    policies.kyverno.io/title: Verify Image Signatures
+    policies.kyverno.io/description: NextOpus images must be signed by this repo's CI
+spec:
+  validationFailureAction: Audit
+  background: false          # verifyImages cannot run in background scans
+  webhookTimeoutSeconds: 30
+  failurePolicy: Fail
+  rules:
+    - name: verify-nextopus-images
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - nextopus
+                - nextopus-system
+      verifyImages:
+        - imageReferences:
+            - "ghcr.io/adxmrxk/data-generator:*"
+            - "ghcr.io/adxmrxk/data-processor:*"
+            - "ghcr.io/adxmrxk/guardian:*"
+          mutateDigest: true       # pin the tag to the digest that was verified
+          verifyDigest: true
+          required: true
+          attestors:
+            - count: 1
+              entries:
+                - keyless:
+                    subject: "https://github.com/adxmrxk/NextOpus/.github/workflows/ci.yaml@refs/heads/main"
+                    issuer: "https://token.actions.githubusercontent.com"
+                    rekor:
+                      url: https://rekor.sigstore.dev
+---
 # NextOpus Security Policies
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy

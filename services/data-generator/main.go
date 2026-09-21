@@ -61,6 +61,10 @@ type Generator struct {
 	httpClient   *http.Client
 	eventTypes   []string
 	sources      []string
+	// Capacity-1 channel used as a try-lock, so at most one flush runs at a
+	// time. Previously every full batch spawned a goroutine, which under load
+	// meant unbounded goroutines all contending for the same buffer.
+	flushing chan struct{}
 }
 
 // Prometheus metrics
@@ -168,8 +172,9 @@ func loadConfig() Config {
 
 func NewGenerator(config Config) *Generator {
 	return &Generator{
-		config: config,
-		buffer: make([]DataEvent, 0, config.BatchSize*2),
+		config:   config,
+		buffer:   make([]DataEvent, 0, config.BatchSize*2),
+		flushing: make(chan struct{}, 1),
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 			// otelhttp injects W3C tracecontext headers on every request, which
@@ -245,11 +250,30 @@ func (g *Generator) generateEvent() DataEvent {
 	}
 }
 
-func (g *Generator) addToBuffer(event DataEvent) {
+// addToBuffer appends an event and returns the buffer length observed under
+// the lock. Callers must use this return value rather than reading
+// len(g.buffer) themselves, which races with flushBuffer truncating it.
+func (g *Generator) addToBuffer(event DataEvent) int {
 	g.bufferMu.Lock()
 	defer g.bufferMu.Unlock()
 	g.buffer = append(g.buffer, event)
-	bufferUtilization.Set(float64(len(g.buffer)))
+	n := len(g.buffer)
+	bufferUtilization.Set(float64(n))
+	return n
+}
+
+// triggerFlush starts a flush unless one is already running. A dropped trigger
+// is harmless: the in-flight flush drains whatever is in the buffer, and the
+// periodic ticker catches anything that arrives after it.
+func (g *Generator) triggerFlush() {
+	select {
+	case g.flushing <- struct{}{}:
+		go func() {
+			defer func() { <-g.flushing }()
+			g.flushBuffer()
+		}()
+	default:
+	}
 }
 
 func (g *Generator) flushBuffer() {
@@ -351,14 +375,15 @@ func (g *Generator) Run(ctx context.Context) {
 			generationLatency.Observe(time.Since(start).Seconds())
 
 			eventsGenerated.WithLabelValues(event.Type, event.Source).Inc()
-			g.addToBuffer(event)
 
-			if len(g.buffer) >= g.config.BatchSize {
-				go g.flushBuffer()
+			// Use the length returned under the lock; reading len(g.buffer)
+			// here raced with flushBuffer truncating it.
+			if n := g.addToBuffer(event); n >= g.config.BatchSize {
+				g.triggerFlush()
 			}
 
 		case <-flushTicker.C:
-			go g.flushBuffer()
+			g.triggerFlush()
 		}
 	}
 }
